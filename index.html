@@ -158,6 +158,9 @@ const CSS = `
 .ar-em .d{font-family:'IBM Plex Mono',monospace; font-size:16px; color:var(--ink); margin:1px 0}
 .ar-em .m{font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:var(--co2); margin-bottom:2px}
 .ar-em .r{font-family:'IBM Plex Mono',monospace; font-size:9px; color:var(--dim)}
+.ar-em .c{font-family:'IBM Plex Mono',monospace; font-size:9px; color:var(--warn); margin-top:1px}
+.ar-em .rp{font-size:9px; color:var(--muted); margin-top:2px; line-height:1.3}
+.ar-em{max-width:170px}
 .ar-toolbar.mon{align-items:flex-start; padding-top:4px}
 .ar-toolbar.mon .ar-toolk{padding-top:9px}
 .ar-ivwrap{display:flex; flex-wrap:wrap; gap:8px; align-items:flex-end; max-width:940px}
@@ -395,13 +398,22 @@ const PROC_ITEMS = ["Op-dent", "Extractions"];
 // Emergency doses, calculated from weight. Reference only — no ceilings applied.
 const EMERG_DRUGS = [
   { name: "Succinylcholine", perKg: 0.5,   unit: "mg" },
-  { name: "Atropine",        perKg: 0.02,  unit: "mg" },
-  { name: "Epi — cardiac",   perKg: 0.01,  unit: "mg", mcg: true },
+  { name: "Atropine",        perKg: 0.02,  unit: "mg", cap: 0.5,
+    note: "repeat 1x · max total 1 mg" },
+  { name: "Epi — cardiac",   perKg: 0.01,  unit: "mg", mcg: true, cap: 1,
+    note: "repeat q3–5 min" },
   { name: "Epi — broncho",   perKg: 0.001, unit: "mg", mcg: true },
-  { name: "Diphenhydramine", perKg: 1,     unit: "mg" },
-  { name: "Naloxone",        perKg: 0.1,   unit: "mg" },
-  { name: "Flumazenil",      perKg: 0.01,  unit: "mg" },
+  { name: "Diphenhydramine", perKg: 1,     unit: "mg", cap: 50 },
+  { name: "Naloxone",        perKg: 0.1,   unit: "mg", cap: 2,
+    note: "repeat q2–3 min prn" },
+  { name: "Flumazenil",      perKg: 0.01,  unit: "mg", cap: 0.2,
+    note: (kg) => `repeat q1 min prn · max total ${kg ? doseFmt(Math.min(kg * 0.05, 1)) : "0.05 mg/kg"} mg` },
 ];
+
+// dose actually given: weight-based, held at the ceiling where one applies
+const emergDose = (d, kg) => Math.min(kg * d.perKg, d.cap ?? Infinity);
+const emergCapped = (d, kg) => d.cap != null && kg * d.perKg > d.cap;
+const emergNote = (d, kg) => (typeof d.note === "function" ? d.note(kg) : d.note);
 
 const mcgFmt = (mg) => {
   const v = mg * 1000;
@@ -1643,9 +1655,16 @@ function AnesthesiaRecord() {
                   {EMERG_DRUGS.map((d) => (
                     <div className="ar-em" key={d.name}>
                       <div className="n">{d.name}</div>
-                      <div className="d">{kg ? `${doseFmt(kg * d.perKg)} ${d.unit}` : "—"}</div>
-                      {d.mcg && <div className="m">{kg ? `${mcgFmt(kg * d.perKg)} mcg` : "—"}</div>}
-                      <div className="r">{d.perKg} {d.unit}/kg</div>
+                      <div className="d">{kg ? `${doseFmt(emergDose(d, kg))} ${d.unit}` : "—"}</div>
+                      {d.mcg && <div className="m">{kg ? `${mcgFmt(emergDose(d, kg))} mcg` : "—"}</div>}
+                      <div className="r">
+                        {d.perKg} {d.unit}/kg
+                        {d.cap != null && ` · max ${d.cap} ${d.unit}`}
+                      </div>
+                      {kg > 0 && emergCapped(d, kg) && (
+                        <div className="c">at max — calc {doseFmt(kg * d.perKg)} {d.unit}</div>
+                      )}
+                      {emergNote(d, kg) && <div className="rp">{emergNote(d, kg)}</div>}
                     </div>
                   ))}
                 </div>
@@ -2215,10 +2234,11 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
         {EMERG_DRUGS.map((d) => (
           <span key={d.name}><b>{d.name}:</b>{" "}
             {parseFloat(P.kg) > 0
-              ? `${doseFmt(parseFloat(P.kg) * d.perKg)} ${d.unit}` +
-                (d.mcg ? ` / ${mcgFmt(parseFloat(P.kg) * d.perKg)} mcg` : "")
+              ? `${doseFmt(emergDose(d, parseFloat(P.kg)))} ${d.unit}` +
+                (d.mcg ? ` / ${mcgFmt(emergDose(d, parseFloat(P.kg)))} mcg` : "")
               : "—"}
-            {" "}({d.perKg} {d.unit}/kg)</span>
+            {" "}({d.perKg} {d.unit}/kg{d.cap != null ? `, max ${d.cap} ${d.unit}` : ""}
+            {emergNote(d, parseFloat(P.kg) || 0) ? `, ${emergNote(d, parseFloat(P.kg) || 0)}` : ""})</span>
         ))}
       </div>
 
