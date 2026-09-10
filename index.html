@@ -74,6 +74,7 @@ const CSS = `
 .ar-hf input::placeholder{color:#38424E}
 .ar-hf input::-webkit-calendar-picker-indicator{filter:invert(.55); cursor:pointer}
 .ar-hf.calc{background:var(--panel2)}
+.ar-hf input:disabled{color:var(--dim); cursor:not-allowed}
 .ar-hf.calc .out{font-family:'IBM Plex Mono',monospace; font-size:19px; line-height:1.15; color:var(--co2)}
 .ar-hf.calc .out.running{color:var(--hr)}
 .ar-hf.calc .out em{font-style:normal; font-size:10px; color:var(--dim); letter-spacing:.1em; margin-left:5px}
@@ -336,7 +337,7 @@ const DRUGS = [
   { id: "ns",   name: "0.9% NS",       unit: "mL", writeTotal: true },
   { id: "n2o",  name: "N₂O",           unit: "L/min", fixedTotal: "QS" },
   { id: "sevo", name: "Sevoflurane",   unit: "%", fixedTotal: "QS" },
-  { id: "iso",  name: "Isoflurane",    unit: "%", fixedTotal: "QS" },
+  { id: "iso",  name: "Isoflurane",    unit: "%", fixedTotal: "QS", onlyWhenUsed: true },
   { id: "pro",  name: "Propofol",      unit: "mg",  perKg: 2.5 },
   { id: "fen",  name: "Fentanyl",      unit: "mcg", perKg: 1 },
   { id: "clo",  name: "Clonidine",     unit: "mcg" },
@@ -570,7 +571,7 @@ const span2 = (a, b) => {
   if (s == null || e == null) return null;
   return e >= s ? e - s : e + 1440 - s;
 };
-const dur = (m) => (m == null ? null : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`);
+const dur = (m) => (m == null ? null : `${m} min`);
 const nowHHMM = () => { const d = new Date(); return toHHMM(d.getHours() * 60 + d.getMinutes()); };
 
 // age in whole months from an ISO date string
@@ -618,7 +619,7 @@ function AnesthesiaRecord() {
     anesType: "GA / DS",
     monitors: Object.fromEntries(MONITORS.map((m) => [m, true])),
     ivSite: "Foot", ivSide: "Right", ivSize: "22", ivAttempts: "1", ivNotes: "",
-    airway: { "22 F": true, R: true, NETT: true },
+    airway: { R: true, NETT: true },
     nettSize: "", oettSize: "", airwayNotes: "",
     technique: Object.fromEntries(TECHNIQUE_ON.map((m) => [m, true])),
     intub: Object.fromEntries(INTUB_ON.map((m) => [m, true])),
@@ -664,7 +665,7 @@ function AnesthesiaRecord() {
   const salt = useRef(Math.floor(Math.random() * 1e6)).current;
   const [edit, setEdit] = useState(null);            // { id, t } cell being typed into
   const [waste, setWaste] = useState({});          // { rowId: amount }
-  const [totals, setTotals] = useState({});        // typed totals, for rows that aren't summed
+  const [totals, setTotals] = useState({ ns: "400" });   // typed totals, for rows that aren't summed
   const [extras, setExtras] = useState([{ id: "x1", name: "" }, { id: "x2", name: "" }]);
 
   useEffect(() => {
@@ -1026,6 +1027,11 @@ function AnesthesiaRecord() {
     setEdit({ id: d.id, t });
   };
 
+  // has anything at all been charted in this row (numbers or text like "2x")?
+  const rowUsed = (id) => Object.entries(doses)
+    .filter(([t]) => lastCol == null || Number(t) <= lastCol)
+    .some(([, col]) => col?.[id] != null && col[id] !== "");
+
   // total given for a row, summed across every charted interval
   const totalOf = (id) => Object.entries(doses)
     .filter(([t]) => lastCol == null || Number(t) <= lastCol)
@@ -1188,10 +1194,10 @@ function AnesthesiaRecord() {
           </div>
 
           <div className="ar-hrow">
-            <Hf l="Anesthesia start" v={preop.anesStart} on={setAnesStart} type="time" times />
-            <Hf l="Anesthesia end" v={preop.anesEnd} on={setAnesEnd} type="time" times />
-            <Hf l="Surgery start" v={preop.surgStart} on={(x) => P("surgStart", x)} type="time" />
-            <Hf l="Surgery end" v={preop.surgEnd} on={(x) => P("surgEnd", x)} type="time" />
+            <TimeField l="Anesthesia start" v={preop.anesStart} on={setAnesStart} times />
+            <TimeField l="Anesthesia end" v={preop.anesEnd} on={setAnesEnd} times />
+            <TimeField l="Surgery start" v={preop.surgStart} on={(x) => P("surgStart", x)} />
+            <TimeField l="Surgery end" v={preop.surgEnd} on={(x) => P("surgEnd", x)} />
             {running && <button className="ar-go stop" onClick={() => setAnesEnd(nowHHMM())}>End now</button>}
           </div>
 
@@ -1200,9 +1206,9 @@ function AnesthesiaRecord() {
               <label>Total anesthesia time</label>
               <div className={`out ${running ? "running" : ""}`}>
                 {anesTotal != null
-                  ? <>{dur(anesTotal)} <em>{anesTotal} min</em></>
+                  ? <>{anesTotal} <em>min</em></>
                   : liveElapsed != null
-                    ? <>{dur(liveElapsed)} <em>running</em></>
+                    ? <>{liveElapsed} <em>min · running</em></>
                     : <span style={{ color: "var(--dim)" }}>——</span>}
               </div>
             </div>
@@ -1210,15 +1216,18 @@ function AnesthesiaRecord() {
               <label>Total surgical time</label>
               <div className="out">
                 {surgTotal != null
-                  ? <>{dur(surgTotal)} <em>{surgTotal} min</em></>
+                  ? <>{surgTotal} <em>min</em></>
                   : <span style={{ color: "var(--dim)" }}>——</span>}
               </div>
             </div>
             <Hf l="Date of service" v={preop.date} on={(x) => P("date", x)} type="date" />
-            <div className="ar-hf tight">
-              <label>Billing units (15 min)</label>
-              <input readOnly value={anesTotal != null ? Math.ceil(anesTotal / 15) : ""} placeholder="——" />
-            </div>
+            <UnitsField
+              units={anesTotal != null ? Math.ceil(anesTotal / 15) : ""}
+              disabled={toMin(preop.anesStart) == null}
+              on={(u) => {
+                if (!u || toMin(preop.anesStart) == null) return;
+                setAnesEnd(toHHMM(toMin(preop.anesStart) + u * 15));
+              }} />
           </div>
         </div>
       )}
@@ -1691,7 +1700,11 @@ function AnesthesiaRecord() {
                         <span className="u">{blocked ? "ALLERGY" : d.unit}</span>
                       </div>
                       {d.fixedTotal
-                        ? <div className="ar-sub a tot" style={{ left: GUT }}>{d.fixedTotal}</div>
+                        ? <div className="ar-sub a tot" style={{ left: GUT }}>
+                            {d.onlyWhenUsed && !rowUsed(d.id)
+                              ? <span className="empty">·</span>
+                              : d.fixedTotal}
+                          </div>
                         : d.writeTotal
                           ? <FixedCell cls="a tot" v={totals[d.id]} left={GUT}
                               editing={edit?.id === d.id && edit?.t === "T"}
@@ -2084,6 +2097,66 @@ function DobPicker({ v, on }) {
   );
 }
 
+// Accepts 730, 0730, 7:30 or 07:30 and settles on 24-hour HH:MM.
+const normTime = (raw) => {
+  const t = (raw || "").trim();
+  if (!t) return "";
+  let h, m;
+  if (t.includes(":")) {
+    const [a, b] = t.split(":");
+    h = parseInt(a, 10); m = parseInt(b, 10);
+  } else {
+    const d = t.replace(/\D/g, "");
+    if (!d) return "";
+    if (d.length <= 2) { h = parseInt(d, 10); m = 0; }
+    else { m = parseInt(d.slice(-2), 10); h = parseInt(d.slice(0, -2), 10); }
+  }
+  if (isNaN(h) || isNaN(m) || h > 23 || m > 59) return "";
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+};
+
+// Billing units and anesthesia end drive each other: enter a time and the units
+// follow; enter units and the end time lands start + units × 15.
+function UnitsField({ units, disabled, on }) {
+  const [draft, setDraft] = useState(null);
+  return (
+    <div className="ar-hf tight">
+      <label>Billing units (15 min)</label>
+      <input
+        value={draft ?? units}
+        inputMode="numeric"
+        placeholder="——"
+        disabled={disabled}
+        title={disabled ? "Enter an anesthesia start time first" : "Type units to set the end time"}
+        onChange={(e) => setDraft(e.target.value)}
+        onFocus={(e) => { setDraft(String(units)); e.target.select(); }}
+        onBlur={(e) => {
+          const u = parseInt(e.target.value, 10);
+          setDraft(null);
+          if (!isNaN(u) && u > 0) on(u);
+        }}
+        onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }} />
+    </div>
+  );
+}
+
+function TimeField({ l, v, on, times }) {
+  const [draft, setDraft] = useState(null);
+  return (
+    <div className={`ar-hf ${times ? "times" : ""}`}>
+      <label>{l}</label>
+      <input
+        value={draft ?? v}
+        inputMode="numeric"
+        placeholder="--:--"
+        onChange={(e) => setDraft(e.target.value)}
+        onFocus={(e) => { setDraft(v); e.target.select(); }}
+        onBlur={(e) => { on(normTime(e.target.value)); setDraft(null); }}
+        onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }} />
+    </div>
+  );
+}
+
 function Hf({ l, v, on, type = "text", grow, times }) {
   return (
     <div className={`ar-hf ${grow ? "grow" : ""} ${times ? "times" : ""}`}>
@@ -2331,7 +2404,7 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
         <div>
           {signedAt && <div className="pr-signame" style={{ fontStyle: "normal" }}>
             {new Date(signedAt).toLocaleDateString()}</div>}
-          Date / time{signedAt ? " — electronically signed" : ""}
+          Date{signedAt ? " — electronically signed" : ""}
         </div>
       </div>
     </div>
