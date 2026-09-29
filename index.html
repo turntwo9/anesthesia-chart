@@ -332,6 +332,8 @@ const CSS = `
 .pr th{background:#efefef; font-family:'IBM Plex Sans Condensed',sans-serif; font-weight:600}
 .pr td.l,.pr th.l{text-align:left; font-family:'IBM Plex Sans Condensed',sans-serif; white-space:nowrap}
 .pr table.pr-grid{table-layout:fixed}
+.pr-band{break-inside:avoid; page-break-inside:avoid; margin-bottom:6px}
+.pr-bandlbl{font-weight:400; letter-spacing:.04em; text-transform:none; color:#555}
 .pr table.pr-grid td,.pr table.pr-grid th{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:1.5px 1px}
 .pr-toolbar{position:sticky; top:0; display:flex; gap:8px; padding:10px 0 14px; background:#fff}
 .pr-toolbar button{padding:9px 18px; border:1px solid #333; border-radius:2px; background:#111; color:#fff;
@@ -2864,18 +2866,29 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
   const rows = Object.entries(vitals).map(([t, v]) => ({ t: +t, ...v }))
     .filter((r) => cols.includes(r.t)).sort((a, b) => a.t - b.t);
 
-  // One column geometry shared by every table and the graph, expressed as
-  // percentages of the same full width, so the printed columns line up exactly.
-  const LW = 78, TW = 26, WW = 26, CW = 34, GHp = 150;
+  // The timeline prints in bands of up to BAND five-minute columns. Within a band the
+  // medication rows, vitals rows and BP/HR graph share one column geometry (percentages
+  // of the same full-band width), so columns line up exactly and stay wide enough to read
+  // in either page orientation. Every band uses the full-band width so columns are the
+  // same size on every page; a short final band simply doesn't reach the right margin.
+  const BAND = 15;
+  const bands = [];
+  for (let i = 0; i < cols.length; i += BAND) bands.push(cols.slice(i, i + BAND));
+  const LW = 92, TW = 30, WW = 30, CW = 40, GHp = 150;
   const GW = LW + TW + WW;                       // where the time columns start
-  const W = GW + cols.length * CW, yv = (v) => GHp - (v / 240) * GHp;
-  const pct = (x) => `${(x / W) * 100}%`;
-  const ColGroup = () => (
-    <colgroup>
-      <col style={{ width: pct(LW) }} /><col style={{ width: pct(TW) }} /><col style={{ width: pct(WW) }} />
-      {cols.map((t) => <col key={t} style={{ width: pct(CW) }} />)}
-    </colgroup>
-  );
+  const WFULL = GW + BAND * CW;
+  const yv = (v) => GHp - (v / 240) * GHp;
+  const bandW = (b) => GW + b.length * CW;
+  const tableStyle = (b) => ({ width: `${(bandW(b) / WFULL) * 100}%` });
+  const ColGroup = ({ band }) => {
+    const Wb = bandW(band), pc = (x) => `${(x / Wb) * 100}%`;
+    return (
+      <colgroup>
+        <col style={{ width: pc(LW) }} /><col style={{ width: pc(TW) }} /><col style={{ width: pc(WW) }} />
+        {band.map((t) => <col key={t} style={{ width: pc(CW) }} />)}
+      </colgroup>
+    );
+  };
   const medRows = [...DRUGS, ...extras.filter((x) => x.name)];
 
   const downloadForPrint = () => {
@@ -3005,77 +3018,96 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
         ))}
       </div>
 
-      <h2>Medications, gases &amp; fluids</h2>
-      <table className="pr-grid">
-        <ColGroup />
-        <thead>
-          <tr>
-            <th className="l">Agent / drug</th><th>Total</th><th>Waste</th>
-            {cols.map((t) => <th key={t}>{tl(t)}</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          {medRows.map((d) => (
-            <tr key={d.id}>
-              <td className="l">{d.name}{d.unit ? ` (${d.unit})` : ""}</td>
-              <td>{totalCell(d)}</td>
-              <td>{d.noWaste ? "" : (waste[d.id] ?? "")}</td>
-              {cols.map((t) => <td key={t}>{doses[t]?.[d.id] ?? ""}</td>)}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {bands.map((band, bi) => {
+        const Wb = bandW(band);
+        const bx = (t) => GW + band.indexOf(t) * CW + CW / 2;
+        const brows = rows.filter((r) => band.includes(r.t));
+        return (
+          <div className="pr-band" key={bi}>
+            <h2>Medications, gases &amp; fluids
+              {bands.length > 1 && <span className="pr-bandlbl"> · {tl(band[0])}–{tl(band[band.length - 1])} (part {bi + 1} of {bands.length})</span>}
+            </h2>
+            <table className="pr-grid" style={tableStyle(band)}>
+              <ColGroup band={band} />
+              <thead>
+                <tr>
+                  <th className="l">Agent / drug</th><th>Total</th><th>Waste</th>
+                  {band.map((t) => <th key={t}>{tl(t)}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {medRows.map((d) => (
+                  <tr key={d.id}>
+                    <td className="l">{d.name}{d.unit ? ` (${d.unit})` : ""}</td>
+                    <td>{totalCell(d)}</td>
+                    <td>{d.noWaste ? "" : (waste[d.id] ?? "")}</td>
+                    {band.map((t) => <td key={t}>{doses[t]?.[d.id] ?? ""}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
 
-      <h2>Vitals</h2>
-      <table className="pr-grid">
-        <ColGroup />
-        <thead>
-          <tr>
-            <th className="l">Value</th><th></th><th></th>
-            {cols.map((t) => <th key={t}>{tl(t)}</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          <tr><td className="l">BP (S/D)</td><td></td><td></td>
-            {cols.map((t) => <td key={t}>{vitals[t]?.sbp != null ? `${vitals[t].sbp}/${vitals[t].dbp}` : ""}</td>)}</tr>
-          <tr><td className="l">HR</td><td></td><td></td>
-            {cols.map((t) => <td key={t}>{vitals[t]?.hr ?? ""}</td>)}</tr>
-          {NUMROWS.map((r) => (
-            <tr key={r.id}><td className="l">{r.name}</td><td></td><td></td>
-              {cols.map((t) => <td key={t}>{vitals[t]?.[r.id] ?? ""}</td>)}</tr>
-          ))}
-        </tbody>
-      </table>
+            <h2>Vitals</h2>
+            <table className="pr-grid" style={tableStyle(band)}>
+              <ColGroup band={band} />
+              <thead>
+                <tr>
+                  <th className="l">Value</th><th></th><th></th>
+                  {band.map((t) => <th key={t}>{tl(t)}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td className="l">BP (S/D)</td><td></td><td></td>
+                  {band.map((t) => <td key={t}>{vitals[t]?.sbp != null ? `${vitals[t].sbp}/${vitals[t].dbp}` : ""}</td>)}</tr>
+                <tr><td className="l">HR</td><td></td><td></td>
+                  {band.map((t) => <td key={t}>{vitals[t]?.hr ?? ""}</td>)}</tr>
+                {NUMROWS.map((r) => (
+                  <tr key={r.id}><td className="l">{r.name}</td><td></td><td></td>
+                    {band.map((t) => <td key={t}>{vitals[t]?.[r.id] ?? ""}</td>)}</tr>
+                ))}
+              </tbody>
+            </table>
 
-      <h2>Blood pressure &amp; heart rate</h2>
-      <svg viewBox={`0 0 ${W} ${GHp}`} preserveAspectRatio="none"
-        style={{ width: "100%", height: `${GHp * 1.15}px`, border: "1px solid #ccc", display: "block" }}>
-        <line x1={GW} x2={GW} y1="0" y2={GHp} stroke="#bbb" strokeWidth="0.6" />
-        {[0, 40, 80, 120, 160, 200, 240].map((v) => (
-          <g key={v}>
-            <line x1={GW} x2={W} y1={yv(v)} y2={yv(v)} stroke="#ddd" strokeWidth="0.6" />
-            <text x={GW - 4} y={yv(v) + 2.5} textAnchor="end" fontSize="7" fill="#666"
-              fontFamily="IBM Plex Mono, monospace">{v}</text>
-          </g>
-        ))}
-        {cols.map((t, i) => (
-          <line key={t} x1={GW + i * CW + CW / 2} x2={GW + i * CW + CW / 2} y1="0" y2={GHp}
-            stroke={t % 15 === 0 ? "#bbb" : "#e4e4e4"} strokeWidth="0.6" />
-        ))}
-        <polyline fill="none" stroke="#111" strokeWidth="1"
-          points={rows.filter((r) => r.hr != null)
-            .map((r) => `${GW + cols.indexOf(r.t) * CW + CW / 2},${yv(r.hr)}`).join(" ")} />
-        {rows.map((r) => {
-          const cx = GW + cols.indexOf(r.t) * CW + CW / 2;
-          return (
-            <g key={r.t}>
-              {r.sbp != null && <path d={`M${cx - 4},${yv(r.sbp) - 4.5} L${cx + 4},${yv(r.sbp) - 4.5} L${cx},${yv(r.sbp)} Z`} fill="#111" />}
-              {r.dbp != null && <path d={`M${cx - 4},${yv(r.dbp) + 4.5} L${cx + 4},${yv(r.dbp) + 4.5} L${cx},${yv(r.dbp)} Z`} fill="#111" />}
-              {r.hr != null && <circle cx={cx} cy={yv(r.hr)} r="2.2" fill="#fff" stroke="#111" strokeWidth="1" />}
-            </g>
-          );
-        })}
-      </svg>
+            <h2>Blood pressure &amp; heart rate</h2>
+            <svg viewBox={`0 0 ${Wb} ${GHp + 12}`} preserveAspectRatio="none"
+              style={{ width: `${(Wb / WFULL) * 100}%`, height: `${(GHp + 12) * 1.15}px`, border: "1px solid #ccc", display: "block" }}>
+              {/* times along the top, so the graph reads on its own as well as under the table */}
+              {band.map((t) => (
+                <text key={"t" + t} x={bx(t)} y="8" textAnchor="middle" fontSize="6.5" fill="#444"
+                  fontFamily="IBM Plex Mono, monospace">{tl(t)}</text>
+              ))}
+              <g transform="translate(0,12)">
+                <line x1={GW} x2={GW} y1="0" y2={GHp} stroke="#bbb" strokeWidth="0.6" />
+                {[40, 80, 120, 160, 200, 240].map((v) => (
+                  <g key={v}>
+                    <line x1={GW} x2={Wb} y1={yv(v)} y2={yv(v)} stroke="#ddd" strokeWidth="0.6" />
+                    <text x={GW - 4} y={yv(v) + 2.5} textAnchor="end" fontSize="7" fill="#666"
+                      fontFamily="IBM Plex Mono, monospace">{v}</text>
+                  </g>
+                ))}
+                <text x={4} y={GHp / 2} fontSize="7.5" fill="#333" fontFamily="IBM Plex Sans Condensed, sans-serif">
+                  ▲▼ BP   ○ HR</text>
+                {band.map((t) => (
+                  <line key={t} x1={bx(t)} x2={bx(t)} y1="0" y2={GHp}
+                    stroke={t % 15 === 0 ? "#bbb" : "#e4e4e4"} strokeWidth="0.6" />
+                ))}
+                <polyline fill="none" stroke="#111" strokeWidth="1"
+                  points={brows.filter((r) => r.hr != null).map((r) => `${bx(r.t)},${yv(r.hr)}`).join(" ")} />
+                {brows.map((r) => {
+                  const cx = bx(r.t);
+                  return (
+                    <g key={r.t}>
+                      {r.sbp != null && <path d={`M${cx - 4},${yv(r.sbp) - 4.5} L${cx + 4},${yv(r.sbp) - 4.5} L${cx},${yv(r.sbp)} Z`} fill="#111" />}
+                      {r.dbp != null && <path d={`M${cx - 4},${yv(r.dbp) + 4.5} L${cx + 4},${yv(r.dbp) + 4.5} L${cx},${yv(r.dbp)} Z`} fill="#111" />}
+                      {r.hr != null && <circle cx={cx} cy={yv(r.hr)} r="2.2" fill="#fff" stroke="#111" strokeWidth="1" />}
+                    </g>
+                  );
+                })}
+              </g>
+            </svg>
+          </div>
+        );
+      })}
 
       <h2>Events</h2>
       {Object.entries(events).filter(([, v]) => v.length).sort((a, b) => a[0] - b[0]).map(([t, list]) => (
