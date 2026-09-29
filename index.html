@@ -333,6 +333,7 @@ const CSS = `
 .pr td.l,.pr th.l{text-align:left; font-family:'IBM Plex Sans Condensed',sans-serif; white-space:nowrap}
 .pr table.pr-grid{table-layout:fixed}
 .pr-band{break-inside:avoid; page-break-inside:avoid; margin-bottom:6px}
+.pr-scroll{overflow-x:auto; -webkit-overflow-scrolling:touch}
 .pr-bandlbl{font-weight:400; letter-spacing:.04em; text-transform:none; color:#555}
 .pr table.pr-grid td,.pr table.pr-grid th{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:1.5px 1px}
 .pr-toolbar{position:sticky; top:0; display:flex; gap:8px; padding:10px 0 14px; background:#fff}
@@ -2856,6 +2857,252 @@ function In2({ l, v, on, opts, text, full, ph }) {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/*  PDF generation — the app draws the record itself (jsPDF), on a     */
+/*  page as wide as the case needs, so a 3-hour timeline is one        */
+/*  continuous strip and nothing depends on the browser's print dialog. */
+/* ------------------------------------------------------------------ */
+let jspdfLoading = null;
+const loadJsPDF = () => {
+  if (window.jspdf?.jsPDF) return Promise.resolve(window.jspdf.jsPDF);
+  if (jspdfLoading) return jspdfLoading;
+  jspdfLoading = new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+    s.onload = () => res(window.jspdf.jsPDF);
+    s.onerror = () => { jspdfLoading = null; rej(new Error("Couldn't load the PDF library — check the connection.")); };
+    document.head.appendChild(s);
+  });
+  return jspdfLoading;
+};
+
+// The built-in PDF fonts can't show subscripts or the check mark; swap them for plain text.
+const pdfText = (v) => String(v ?? "")
+  .replace(/₂/g, "2").replace(/O₂/g, "O2").replace(/√/g, "✓").replace(/’/g, "'").replace(/–/g, "-");
+
+const buildPdf = async (d) => {
+  const { P, vitals, doses, waste, totals, extras, events, cols, totalOf, anesTotal, surgTotal, liveElapsed,
+          aldreteTotal, bmi, months, allergyList, activeFlags, signedAt } = d;
+  const jsPDF = await loadJsPDF();
+
+  // ---- geometry (points) ----
+  const M = 28, LW = 96, TW = 30, WW = 30, CW = 30, RH = 11, GH = 150;
+  const GX = M + LW + TW + WW;                              // where time columns start
+  const timelineW = LW + TW + WW + cols.length * CW;
+  const PW = Math.max(792, 2 * M + timelineW);              // at least letter-landscape; wider as the case needs
+  const PH = 792;                                            // 11 in tall: header and full timeline share page 1
+  const doc = new jsPDF({ unit: "pt", format: [PW, PH], orientation: "landscape", compress: true });
+  doc.setProperties({ title: caseStem(P) });
+  const textW = (t) => doc.getTextWidth(t);
+  let y = M;
+  const ensure = (h) => { if (y + h > PH - M) { doc.addPage([PW, PH], "landscape"); y = M; } };
+
+  const t0 = toMin(P.anesStart);
+  const tl = (t) => (t0 != null ? toHHMM(t0 + t) : String(t));
+  const on = (o) => Object.keys(o || {}).filter((k) => o[k]);
+  const dash = (v) => (v == null || v === "" ? "—" : String(v));
+
+  // ---- text helpers ----
+  const heading = (t) => {
+    y += 4; ensure(22);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(30);
+    doc.text(pdfText(t).toUpperCase(), M, y + 8, { charSpace: 0.8 });
+    doc.setDrawColor(150); doc.setLineWidth(0.5); doc.line(M, y + 12, PW - M, y + 12);
+    y += 19;
+  };
+  // inline flow of [label, value] pairs, wrapping at the right margin
+  const kv = (pairs, size = 8.5) => {
+    doc.setFontSize(size);
+    let x = M; const lh = size + 4; const gap = 14;
+    ensure(lh);
+    pairs.forEach(([k, v]) => {
+      const lab = pdfText(k) + ": ", val = pdfText(v);
+      doc.setFont("helvetica", "bold"); const wl = textW(lab);
+      doc.setFont("helvetica", "normal"); const wv = textW(val);
+      if (wl + wv > PW - 2 * M) {                       // too long for one line: flow it as a paragraph
+        if (x > M) { y += lh; x = M; }
+        para(k, v, size); ensure(lh); return;
+      }
+      if (x > M && x + wl + wv > PW - M) { x = M; y += lh; ensure(lh); }
+      doc.setFont("helvetica", "bold"); doc.text(lab, x, y + size);
+      doc.setFont("helvetica", "normal"); doc.text(val, x + wl, y + size);
+      x += wl + wv + gap;
+    });
+    y += lh + 2;
+  };
+  // bold label followed by wrapped body text
+  const para = (k, v, size = 8.5) => {
+    if (v == null || v === "") return;
+    doc.setFontSize(size);
+    const lab = pdfText(k) + ": ";
+    doc.setFont("helvetica", "bold"); const wl = textW(lab);
+    doc.setFont("helvetica", "normal");
+    const words = pdfText(v).split(/\s+/); const lines = []; let cur = "";
+    const maxW = PW - 2 * M;
+    words.forEach((w) => {
+      const trial = cur ? cur + " " + w : w;
+      const width = textW(trial) + (lines.length === 0 ? wl : 0);
+      if (width > maxW && cur) { lines.push(cur); cur = w; } else cur = trial;
+    });
+    if (cur) lines.push(cur);
+    const lh = size + 3.5;
+    ensure(lh * lines.length + 2);
+    lines.forEach((ln, i) => {
+      if (i === 0) { doc.setFont("helvetica", "bold"); doc.text(lab, M, y + size); doc.setFont("helvetica", "normal"); doc.text(ln, M + wl, y + size); }
+      else doc.text(ln, M, y + size);
+      y += lh;
+    });
+    y += 2;
+  };
+
+  // ---- grid ----
+  const check = (cx, cy) => { doc.setDrawColor(20); doc.setLineWidth(0.9); doc.line(cx - 2.6, cy, cx - 0.8, cy + 1.9); doc.line(cx - 0.8, cy + 1.9, cx + 2.8, cy - 2.4); };
+  const colX = (i) => GX + i * CW;
+  const gridHeader = (firstLabel, withTotals) => {
+    ensure(RH);
+    doc.setFillColor(238); doc.setDrawColor(170); doc.setLineWidth(0.4);
+    doc.rect(M, y, timelineW, RH, "FD");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(6.6); doc.setTextColor(20);
+    doc.text(firstLabel, M + 3, y + 7.6);
+    if (withTotals) { doc.text("Total", M + LW + TW / 2, y + 7.6, { align: "center" }); doc.text("Waste", M + LW + TW + WW / 2, y + 7.6, { align: "center" }); }
+    doc.line(M + LW, y, M + LW, y + RH); doc.line(M + LW + TW, y, M + LW + TW, y + RH); doc.line(M + LW + TW + WW, y, M + LW + TW + WW, y + RH);
+    doc.setFont("courier", "bold");
+    cols.forEach((t, i) => { doc.text(tl(t), colX(i) + CW / 2, y + 7.6, { align: "center" }); if (i) doc.line(colX(i), y, colX(i), y + RH); });
+    y += RH;
+  };
+  const gridRow = (label, total, wasteV, cells) => {
+    ensure(RH);
+    doc.setDrawColor(190); doc.setLineWidth(0.4); doc.rect(M, y, timelineW, RH, "S");
+    doc.setFont("helvetica", "normal"); doc.setFontSize(6.6); doc.setTextColor(20);
+    doc.text(pdfText(label), M + 3, y + 7.6);
+    doc.line(M + LW, y, M + LW, y + RH); doc.line(M + LW + TW, y, M + LW + TW, y + RH); doc.line(M + LW + TW + WW, y, M + LW + TW + WW, y + RH);
+    doc.setFont("courier", "normal");
+    const put = (v, cx) => { if (v === "√") check(cx, y + 6); else if (v !== "" && v != null) doc.text(pdfText(v), cx, y + 7.6, { align: "center" }); };
+    put(total, M + LW + TW / 2); put(wasteV, M + LW + TW + WW / 2);
+    cells.forEach((v, i) => { if (i) doc.line(colX(i), y, colX(i), y + RH); put(v, colX(i) + CW / 2); });
+    y += RH;
+  };
+
+  // ---- header block ----
+  doc.setFont("helvetica", "bold"); doc.setFontSize(14); doc.setTextColor(20);
+  doc.text("ANESTHESIA RECORD", M, y + 12, { charSpace: 0.6 }); y += 20;
+  kv([["Patient", dash(P.name)], ["DOB", `${dash(P.dob)} (${fmtAge(months) ?? "—"})`], ["Gender", dash(P.sex)],
+      ["ID", dash(P.idNum)], ["Plan", dash(P.plan)], ["Auth", dash(P.authNum)], ["Date", P.date]]);
+  kv([["Wt", `${dash(P.kg)} kg`], ["Ht", `${dash(P.heightIn)} in`], ["BMI", dash(bmi)], ["ASA", P.asa],
+      ["NPO solids", dash(P.npoSolids)], ["NPO clears", dash(P.npoClears)],
+      ["Anes", `${dash(P.anesStart)}–${dash(P.anesEnd)} (${dur(anesTotal ?? liveElapsed) ?? "—"})`],
+      ["Surg", `${dash(P.surgStart)}–${dash(P.surgEnd)} (${dur(surgTotal) ?? "—"})`],
+      ["Units (15 min)", anesTotal != null ? Math.ceil(anesTotal / 15) : "—"]]);
+
+  heading("Pre-op evaluation");
+  kv([["BP", dash(P.bp)], ["HR", dash(P.baseHr)], ["SpO2", dash(P.baseSpo2)], ["RR", dash(P.baseRr)], ["Temp", dash(P.baseTemp)],
+      ["MP", P.mp], ["ECG", P.ecg], ["CV", P.cvRRR ? "RRR w/o MRG" : "—"], ["Lungs", dash(P.lungs)],
+      ["Allergies", P.nkda ? "NKDA" : (allergyList.join(", ") || "—")]]);
+  para("Medical history", P.pmh); para("Medications", P.meds); para("Notes", P.notes);
+  if (activeFlags.length) para("Flags", activeFlags.map((f) => f.label).join(" · "));
+
+  heading("Case detail");
+  kv([["Type", P.anesType], ["Monitors", on(P.monitors).join(", ") || "—"]]);
+  kv([["IV", [P.ivSite, P.ivSide, P.ivSize && `${P.ivSize} ga`, P.ivAttempts && `${P.ivAttempts} attempt(s)`].filter(Boolean).join(", ") + (P.ivNotes ? ` — ${P.ivNotes}` : "")],
+      ["Airway", on(P.airway).map((k) => k === "NETT" ? `NETT #${P.nettSize || "—"}` : k === "OETT" ? `OETT #${P.oettSize || "—"}` : k).join(", ") + (P.airwayNotes ? ` — ${P.airwayNotes}` : "") || "—"]]);
+  kv([["Technique", on(P.technique).join(", ") || "—"]]);
+  kv([["Intubation", [...on(P.intub).map((k) => k === "KV" ? `KV #${P.kvSize}` : k), `Attempts ${dash(P.intubAttempts)}`, `Grade ${dash(P.intubGrade)} view`].join(", ")],
+      ["Procedure", [...on(P.procs), P.procOther && (P.procOtherText || "✓")].filter(Boolean).join(", ") || "—"],
+      ["Extubation", on(P.extub).join(", ") || "—"]]);
+
+  const kgN = parseFloat(P.kg) || 0;
+  heading(`Emergency medications — calculated for ${P.kg || "—"} kg`);
+  kv(EMERG_DRUGS.map((dr) => [dr.name.replace("—", "-"),
+      (kgN > 0 ? `${doseFmt(emergDose(dr, kgN))} ${dr.unit}` + (dr.mcg ? ` / ${mcgFmt(emergDose(dr, kgN))} mcg` : "") : "—")
+      + ` (${dr.perKg} ${dr.unit}/kg${dr.cap != null ? `, max ${dr.cap} ${dr.unit}` : ""}${emergNote(dr, kgN) ? `, ${emergNote(dr, kgN)}` : ""})`]), 8);
+
+  // ---- timeline: medications, vitals, then one continuous graph — kept together ----
+  const medRows = [...DRUGS, ...extras.filter((x) => x.name)];
+  const usedInCase = (id) => cols.some((t) => { const v = doses[t]?.[id]; return v != null && v !== ""; });
+  const totalCell = (dr) => dr.fixedTotal ? (dr.onlyWhenUsed && !usedInCase(dr.id) ? "" : dr.fixedTotal)
+    : dr.writeTotal ? (totals[dr.id] ?? "") : totalOf(dr.id) ? round(totalOf(dr.id)) : "";
+  const timelineH = 19 + RH * (medRows.length + 1) + 8 + 19 + RH * (NUMROWS.length + 3) + 8 + 19 + RH + GH + 6;
+  if (y + timelineH > PH - M) { doc.addPage([PW, PH], "landscape"); y = M; }
+
+  heading("Medications, gases & fluids");
+  gridHeader("Agent / drug", true);
+  medRows.forEach((dr) => gridRow(`${dr.name}${dr.unit ? ` (${dr.unit})` : ""}`, totalCell(dr), dr.noWaste ? "" : (waste[dr.id] ?? ""),
+    cols.map((t) => doses[t]?.[dr.id] ?? "")));
+  y += 8;
+
+  heading("Vitals");
+  gridHeader("Value", false);
+  gridRow("BP (S/D)", "", "", cols.map((t) => vitals[t]?.sbp != null ? `${vitals[t].sbp}/${vitals[t].dbp}` : ""));
+  gridRow("HR", "", "", cols.map((t) => vitals[t]?.hr ?? ""));
+  NUMROWS.forEach((r) => gridRow(r.name, "", "", cols.map((t) => vitals[t]?.[r.id] ?? "")));
+  y += 8;
+
+  heading("Blood pressure & heart rate");
+  gridHeader("", false);
+  const gy = y, yv = (v) => gy + GH - (v / 240) * GH;
+  doc.setDrawColor(170); doc.setLineWidth(0.4); doc.rect(M, gy, timelineW, GH, "S");
+  doc.line(GX, gy, GX, gy + GH);
+  doc.setFont("courier", "normal"); doc.setFontSize(6); doc.setTextColor(90);
+  [40, 80, 120, 160, 200, 240].forEach((v) => {
+    doc.setDrawColor(220); doc.line(GX, yv(v), M + timelineW, yv(v));
+    if (v < 240) doc.text(String(v), GX - 4, yv(v) + 2, { align: "right" });
+  });
+  cols.forEach((t, i) => { doc.setDrawColor(t % 15 === 0 ? 185 : 228); doc.line(colX(i) + CW / 2, gy, colX(i) + CW / 2, gy + GH); });
+  // legend in the gutter
+  doc.setFont("helvetica", "normal"); doc.setFontSize(7); doc.setTextColor(40);
+  doc.setFillColor(20); doc.triangle(M + 6, gy + 14, M + 12, gy + 14, M + 9, gy + 19, "F"); doc.text("systolic", M + 16, gy + 19);
+  doc.triangle(M + 6, gy + 32, M + 12, gy + 32, M + 9, gy + 27, "F"); doc.text("diastolic", M + 16, gy + 32);
+  doc.setFillColor(255); doc.setDrawColor(20); doc.setLineWidth(0.8); doc.circle(M + 9, gy + 42, 2.2, "FD"); doc.text("heart rate", M + 16, gy + 45);
+  const rows = cols.map((t, i) => ({ i, t, ...(vitals[t] || {}) }));
+  doc.setDrawColor(20); doc.setLineWidth(0.8);
+  let prev = null;
+  rows.forEach((r) => {
+    if (r.hr == null) { prev = null; return; }
+    const x = colX(r.i) + CW / 2, yy = yv(r.hr);
+    if (prev) doc.line(prev[0], prev[1], x, yy);
+    prev = [x, yy];
+  });
+  rows.forEach((r) => {
+    const x = colX(r.i) + CW / 2;
+    doc.setFillColor(20); doc.setDrawColor(20);
+    if (r.sbp != null) doc.triangle(x - 3.5, yv(r.sbp) - 4, x + 3.5, yv(r.sbp) - 4, x, yv(r.sbp), "F");
+    if (r.dbp != null) doc.triangle(x - 3.5, yv(r.dbp) + 4, x + 3.5, yv(r.dbp) + 4, x, yv(r.dbp), "F");
+    if (r.hr != null) { doc.setFillColor(255); doc.setLineWidth(0.8); doc.circle(x, yv(r.hr), 2, "FD"); }
+  });
+  y = gy + GH + 10;
+
+  // ---- events, recovery, signature ----
+  heading("Events");
+  const evs = Object.entries(events).filter(([, v]) => v.length).sort((a, b) => a[0] - b[0]);
+  if (!evs.length) para("", "—");
+  evs.forEach(([t, list]) => { doc.setFont("courier", "normal"); doc.setFontSize(8.5); ensure(12);
+    doc.text(tl(+t), M, y + 8.5); doc.setFont("helvetica", "normal"); doc.text("— " + pdfText(list.join(" · ")), M + 34, y + 8.5); y += 12; });
+  y += 2;
+
+  heading("Recovery & discharge");
+  para("Emergence", on(P.emerg).join("; ") || "—");
+  para("Course", (P.uneventful ? "Uneventful anesthetic" : "—") + (P.comments ? ` — ${P.comments}` : ""));
+  para("Discharge", [...on(P.disch), P.dischWith && `D/c with: ${P.dischWithText || "—"}`].filter(Boolean).join("; "));
+  para("Aldrete", ALDRETE.map((r) => `${r.k} ${P.aldrete[r.k] ?? "—"}`).join(", ") + ` — total ${aldreteTotal}/10`);
+  para("Present", `Surgeon ${dash(P.surgeon)}; Assistants ${dash(P.assistants)}; Anesthesiologist ${dash(P.anesthesiologist)}`);
+
+  ensure(60); y += 26;
+  const half = (PW - 2 * M - 40) / 2;
+  doc.setDrawColor(20); doc.setLineWidth(0.7);
+  doc.line(M, y, M + half, y); doc.line(M + half + 40, y, PW - M, y);
+  if (signedAt) {
+    doc.setFont("helvetica", "bolditalic"); doc.setFontSize(13); doc.setTextColor(20);
+    doc.text(pdfText(P.anesthesiologist || ""), M, y - 4);
+    doc.setFont("helvetica", "bold"); doc.text(new Date(signedAt).toLocaleDateString(), M + half + 40, y - 4);
+  }
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(60);
+  doc.text(`Anesthesiologist signature — ${pdfText(P.anesthesiologist || "")}`, M, y + 10);
+  doc.text(`Date${signedAt ? " — electronically signed" : ""}`, M + half + 40, y + 10);
+
+  doc.save(`${caseStem(P)}.pdf`);
+  return { pages: doc.getNumberOfPages(), widthIn: (PW / 72).toFixed(1) };
+};
+
 function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, cols, totalOf,
   anesTotal, surgTotal, liveElapsed, aldreteTotal, bmi, months, allergyList, activeFlags,
   signedAt, onSign, onBack }) {
@@ -2871,9 +3118,10 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
   // of the same full-band width), so columns line up exactly and stay wide enough to read
   // in either page orientation. Every band uses the full-band width so columns are the
   // same size on every page; a short final band simply doesn't reach the right margin.
-  const BAND = 15;
-  const bands = [];
-  for (let i = 0; i < cols.length; i += BAND) bands.push(cols.slice(i, i + BAND));
+  // On screen the whole case is one strip that scrolls sideways; the PDF (buildPdf) does the
+  // same on a page wide enough to hold it. Bands are kept only as the rendering unit.
+  const BAND = Math.max(cols.length, 1);
+  const bands = [cols];
   const LW = 92, TW = 30, WW = 30, CW = 40, GHp = 150;
   const GW = LW + TW + WW;                       // where the time columns start
   const WFULL = GW + BAND * CW;
@@ -2891,27 +3139,15 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
   };
   const medRows = [...DRUGS, ...extras.filter((x) => x.name)];
 
-  const downloadForPrint = () => {
-    const el = document.querySelector(".pr");
-    if (!el) return;
-    const clone = el.cloneNode(true);
-    clone.querySelectorAll(".no-print").forEach((nd) => nd.remove());
-    const title = `${caseStem(P)}`;
-    const html = [
-      "<!doctype html><html><head><meta charset=\"utf-8\">",
-      `<title>${title}</title>`,
-      "<style>", CSS, " body{margin:0;background:#fff} ", "</style>",
-      "<script>window.addEventListener('load',function(){setTimeout(function(){window.print()},400)})</scr" + "ipt>",
-      "</head><body><div class=\"ar\">", clone.outerHTML, "</div></body></html>",
-    ].join("");
-    const blob = new Blob([html], { type: "text/html" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `${caseStem(P)}.html`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 8000);
+  const [pdfMsg, setPdfMsg] = useState(null);
+  const downloadPdf = async () => {
+    setPdfMsg("Building PDF…");
+    try {
+      const r = await buildPdf({ P, vitals, doses, waste, totals, extras, events, cols, totalOf, anesTotal, surgTotal,
+        liveElapsed, aldreteTotal, bmi, months, allergyList, activeFlags, signedAt });
+      setPdfMsg(`PDF saved — ${r.pages} page(s), ${r.widthIn} in wide.`);
+    } catch (e) { setPdfMsg(e.message || String(e)); }
+    setTimeout(() => setPdfMsg(null), 6000);
   };
   // did this row get anything charted during the case?
   const usedInCase = (id) => cols.some((t) => {
@@ -2927,22 +3163,21 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
   return (
     <div className="pr">
       <div className="pr-toolbar no-print">
-        <button onClick={downloadForPrint}>Download for print / PDF</button>
+        <button onClick={downloadPdf}>Download PDF</button>
         <button className="alt" onClick={() => {
           const prev = document.title;
           document.title = caseStem(P);      // becomes the suggested PDF filename
           window.print();
           setTimeout(() => { document.title = prev; }, 1000);
-        }}>Try direct print</button>
+        }}>Print (browser)</button>
         {signedAt
           ? <button className="alt" onClick={() => onSign(null)}>Remove signature</button>
           : <button className="alt" onClick={() => onSign(new Date().toISOString())}>Sign &amp; date</button>}
         <button className="alt" onClick={onBack}>Back to record</button>
       </div>
       <div className="no-print" style={{ fontSize: 11, color: "#555", margin: "-6px 0 12px" }}>
-        Downloads a single file of this record. Open it and the print dialog appears on its own —
-        choose <b>Save as PDF</b> and pick Desktop as the destination. (Direct print is blocked
-        inside this preview on most devices.)
+        {pdfMsg || <>Download PDF builds the record on a page as wide as the case needs, so the whole timeline
+        prints as one continuous strip. Sign first if the case is complete.</>}
       </div>
 
       <h1>Anesthesia Record</h1>
@@ -3018,12 +3253,13 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
         ))}
       </div>
 
+      <div className="pr-scroll">
       {bands.map((band, bi) => {
         const Wb = bandW(band);
         const bx = (t) => GW + band.indexOf(t) * CW + CW / 2;
         const brows = rows.filter((r) => band.includes(r.t));
         return (
-          <div className="pr-band" key={bi}>
+          <div className="pr-band" key={bi} style={{ minWidth: WFULL }}>
             <h2>Medications, gases &amp; fluids
               {bands.length > 1 && <span className="pr-bandlbl"> · {tl(band[0])}–{tl(band[band.length - 1])} (part {bi + 1} of {bands.length})</span>}
             </h2>
@@ -3108,6 +3344,8 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
           </div>
         );
       })}
+      </div>
+      <style>{`@media print { @page { size: ${((WFULL + 80) / 96).toFixed(2)}in 8.5in; margin: 0 } .pr-scroll { overflow: visible } }`}</style>
 
       <h2>Events</h2>
       {Object.entries(events).filter(([, v]) => v.length).sort((a, b) => a[0] - b[0]).map(([t, list]) => (
