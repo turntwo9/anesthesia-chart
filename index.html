@@ -150,6 +150,7 @@ const CSS = `
 .ar-scanbtn .ic{font-size:16px; line-height:1}
 .ar-scanbtn:disabled{background:var(--panel2); color:var(--dim); cursor:not-allowed}
 .ar-scanmsg{font-size:12.5px; color:var(--ink); margin-bottom:8px}
+.ar-kind{color:var(--spo2); font-weight:600}
 .ar-bar{height:6px; background:var(--panel2); border-radius:3px; overflow:hidden; max-width:420px}
 .ar-bar div{height:100%; background:var(--spo2); transition:width .25s ease}
 .ar-thumb{width:92px; height:92px; object-fit:cover; border-radius:2px; border:1px solid var(--line-hi); background:#000}
@@ -1288,12 +1289,7 @@ function AnesthesiaRecord() {
       {view === "preop" ? (
         <div className="ar-preop">
           <ScanCard preop={preop} onApply={(patch) => {
-            const p2 = { ...patch };
-            if ("allergies" in p2) {
-              if (/^nkda$/i.test(p2.allergies)) { p2.nkda = true; p2.allergies = ""; }
-              else p2.nkda = false;
-            }
-            setPreop((p) => ({ ...p, ...p2 }));
+            setPreop((p) => ({ ...p, ...patch }));
             setIoMsg(`Filled ${Object.keys(patch).length} field(s) from the scanned document — review them before proceeding.`);
             setTimeout(() => setIoMsg(null), 7000);
           }} />
@@ -2166,10 +2162,31 @@ const fixDate = (s) => s.replace(/[_~]/g, "")
 
 // Turns raw OCR (or a PDF text layer) into candidate values for the preop fields.
 // Everything here is a best guess for the user to confirm — never applied silently.
+// Which of the practice's three source documents this is, and which fields each one owns.
+const DOC_KINDS = {
+  ahcccs: { label: "AHCCCS eligibility", take: ["name", "dob", "sex", "idNum", "plan"] },
+  auth:   { label: "Authorization summary", take: ["authNum"] },
+  intake: { label: "Patient intake form", take: ["kg", "heightIn"] },
+  other:  { label: "Other document", take: ["name", "dob", "sex", "idNum", "plan", "authNum", "kg", "heightIn", "npoSolids", "npoClears"] },
+};
+const detectKind = (text) => {
+  if (/Authorization\s*(Number|Summary)/i.test(text)) return "auth";
+  if (/AHCCCS\s*ID|Member\s*Eligibility\s*Verification|Health\s*Plan\s*ID|Returned\s*Data/i.test(text)) return "ahcccs";
+  if (/PATIENT\s*INFORMATION|RESPONSIBLE\s*PARTY|Arizona\s*Dental\s*Anesthesia|MEDICAL\s*HISTORY/i.test(text)) return "intake";
+  return "other";
+};
+
 const extractFromText = (raw) => {
   const text = raw.replace(/\r/g, "").replace(/[|]/g, "I");
-  const lines0 = text.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
+  let lines0 = text.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
   const out = {}, hints = {};
+  const kind = detectKind(text);
+
+  // AHCCCS screen: the "Requested Data" block repeats every label, empty — read only what follows "Returned Data"
+  if (kind === "ahcccs") {
+    const rd = lines0.findIndex((l) => /Returned\s*Data/i.test(l));
+    if (rd >= 0) lines0 = lines0.slice(rd);
+  }
 
   // ---- sections: values under a parent/guarantor heading belong to the adult, not the patient ----
   const RP_HEAD = /^(RESPONSIBLE PARTY|PARENT|GUARDIAN|PARENT\s*\/\s*GUARDIAN|GUARANTOR|EMERGENCY CONTACT|INSURANCE HOLDER|SUBSCRIBER|POLICY ?HOLDER|ACCOUNT HOLDER)\b/i;
@@ -2335,20 +2352,28 @@ const extractFromText = (raw) => {
   if (au && au !== out.idNum) out.authNum = au;
 
   // ---- plan: the practice's list, with the names each payer shows up under ----
+  // "Mer\w?\W? Care" tolerates OCR mangling of Mercy ("MERQ' CARE")
+  const MERCY = "Mer\\w{0,3}\\W{0,2}\\s*Care";
   const PLAN_ALIASES = [
-    ["DCS / Liberty", /\bDCS\b.*\b(Liberty|Mercy\s*Care)\b|\b(Liberty|Mercy\s*Care)\b.*\bDCS\b/i],
+    ["DCS / Liberty", new RegExp("\\bDCS\\b.*\\b(Liberty|" + MERCY + ")\\b|\\b(Liberty|" + MERCY + ")\\b.*\\bDCS\\b", "i")],
     ["DCS / UHC", /\bDCS\b.*\b(UHC|United\s*Health|APIPA)|\b(UHC|United\s*Health|APIPA)\w*.*\bDCS\b/i],
-    ["Liberty", /\b(Liberty|Mercy\s*Care)\b/i],
+    ["Liberty", new RegExp("\\b(Liberty|" + MERCY + ")\\b", "i")],
     ["UHC", /\b(UHC|United\s*Health(?:\s*Care|care)?|UnitedHealthcare|APIPA\w*)\b/i],
     ["DentaQuest", /\b(Denta\s*Quest|Banner)\b/i],
     ["Health Choice", /\bHealth\s*Choice\b/i],
-    ["AIHP", /\bAIHP\b/i],
+    ["AIHP", /\b(AIHP|American\s*Indian\s*Health)\b/i],
     ["Molina", /\bMolina\b/i],
-    ["Envolve", /\bEnvolve\b/i],
+    ["Envolve", /\b(Envolve|Arizona\s*Complete\s*Health)\b/i],
     ["Care 1st", /\bCare\s*1st\b/i],
     ["FFS", /\b(FFS|Fee[\s\-]*for[\s\-]*Service)\b/i],
   ];
-  for (const [plan, re] of PLAN_ALIASES) { if (re.test(text)) { out.plan = plan; break; } }
+  // On the AHCCCS screen the current enrollment sits under "Health Plan ID/Description";
+  // read there first so an older plan mentioned elsewhere on the page can't win.
+  const hpIdx = lines.findIndex((l) => /Health\s*Plan\s*ID/i.test(l));
+  const planScopes = hpIdx >= 0 ? [lines.slice(hpIdx, hpIdx + 6).join("\n"), text] : [text];
+  outer: for (const scope of planScopes) {
+    for (const [plan, re] of PLAN_ALIASES) { if (re.test(scope)) { out.plan = plan; break outer; } }
+  }
 
   // ---- weight / height ----
   const num = (s) => { const m = (s || "").match(/(\d{1,3}(?:\.\d+)?)/); return m ? parseFloat(m[1]) : null; };
@@ -2392,43 +2417,18 @@ const extractFromText = (raw) => {
     if (any) out.npoSolids = tidyTime(any[1]);
   }
 
-  // ---- medical history ----
-  // a Y/N checklist reads as noise; the free-text "discuss any medical problems" line is the signal
-  const CHECKLIST = /\b(latex|asthma|hemophilia|tuberculosis|mastocytosis|autism|diabetes|down syndrome|cerebral palsy|sickle cell|malignant hyperthermia|seizure|epilepsy|heart murmur|pregnant)\b/i;
-  const isChecklist = (s) => (s.match(CHECKLIST) || []).length >= 1 && /\b[YN]\b/.test(s) || (s.match(new RegExp(CHECKLIST.source, "gi")) || []).length >= 3;
-  let pmh = after(/\b(?:discuss|describe|list|explain)\s+(?:any|all)?\s*(?:medical\s+)?(?:problems|conditions|history|illnesses)[^:]*/i);
-  if (!pmh) pmh = blockAfter(/\b(Past\s*Medical\s*History|PMH)\b/i);
-  if (!pmh) {
-    const b = blockAfter(/\b(Medical\s*History|Hx|History)\b/i);
-    if (b && !isChecklist(b) && !/has your child|following medical/i.test(b)) pmh = b;
-  }
-  if (pmh) out.pmh = NONE.test(pmh) ? "None" : pmh.replace(/;\s*$/, "");
+  // ---- keep only the fields this kind of document owns ----
+  const allowed = DOC_KINDS[kind].take;
+  Object.keys(out).forEach((k) => { if (!allowed.includes(k) || out[k] == null || out[k] === "") delete out[k]; });
+  Object.keys(hints).forEach((k) => { if (!(k in out)) delete hints[k]; });
+  return { fields: out, hints, kind };
 
-  // ---- medications: "current medications" beats a checklist line that merely mentions them ----
-  let meds = after(/\b(?:list\s+all\s+)?current\s+medications?\b[^:]*/i)
-          || after(/\b(?:list\s+all\s+medications?)\b[^:]*/i)
-          || blockAfter(/^(?:Medications?|Meds)\b/i);
-  if (!meds) {
-    const c = afterAllIn(ptLines, /\b(Medications?|Meds)\b/i).find((x) => !/allerg|please list below|\(.*\)$/i.test(x.line));
-    if (c) meds = c.v;
-  }
-  if (meds) out.meds = NONE.test(meds) ? "None" : meds;
-
-  // ---- allergies: "N/A" or "NKDA" means no known drug allergies ----
-  const alC = afterAllIn(ptLines, /\b(?:list\s+all\s+)?allerg(?:y|ies)\b(?:\s*\([^)]*\))?/i)
-    .find((x) => !/\bto\s+(latex|medications?)\b|please list below/i.test(x.line) && x.v && !/^\(/.test(x.v));
-  if (alC) out.allergies = NONE.test(alC.v) ? "NKDA" : alC.v.replace(/\bmedicine,?\s*food,?\s*latex,?\s*etc\.?\)?:?\s*/i, "").trim();
-  else if (/\bNKDA\b/i.test(text)) out.allergies = "NKDA";
-
-  Object.keys(out).forEach((k) => { if (out[k] == null || out[k] === "") delete out[k]; });
-  return { fields: out, hints };
 };
 
 const SCAN_FIELDS = [
   ["name", "Patient name"], ["dob", "Date of birth"], ["idNum", "ID number"], ["plan", "Plan"],
   ["authNum", "Authorization number"], ["sex", "Gender"], ["kg", "Weight (kg)"], ["heightIn", "Height (in)"],
-  ["npoSolids", "NPO solids"], ["npoClears", "NPO clears"], ["allergies", "Allergies"],
-  ["pmh", "Medical history"], ["meds", "Medications"],
+  ["npoSolids", "NPO solids"], ["npoClears", "NPO clears"],
 ];
 
 // pdf.js, loaded on first PDF. Eligibility and authorization printouts saved as PDF
@@ -2519,14 +2519,15 @@ function ScanCard({ preop, onApply }) {
         setSt({ phase: "working", msg: "Loading OCR engine…", pct: 5, preview });
         text = await ocr(canvas, (p) => setSt((s) => ({ ...s, msg: "Reading document…", pct: 10 + Math.round(p * 90) })));
       }
-      const { fields: found, hints: h } = extractFromText(text);
+      const { fields: found, hints: h, kind } = extractFromText(text);
       // a second document adds to what the first found rather than replacing it
       setVals((prev) => ({ ...prev, ...found }));
       setHints((prev) => ({ ...prev, ...h }));
       setUse((prev) => ({ ...prev, ...Object.fromEntries(Object.keys(found).map((k) => [k, true])) }));
       setSt((s) => {
         if (s.preview && s.preview !== preview && s.preview.startsWith("blob:")) URL.revokeObjectURL(s.preview);
-        return { phase: "review", preview, text: ((s.text || "") + "\n\n" + text).trim(), n: Object.keys(found).length };
+        const kinds = [...(s.kinds || []), DOC_KINDS[kind].label];
+        return { phase: "review", preview, text: ((s.text || "") + "\n\n" + text).trim(), n: Object.keys(found).length, kinds };
       });
     } catch (e) {
       setSt({ phase: "error", msg: e.message || String(e), preview });
@@ -2557,10 +2558,10 @@ function ScanCard({ preop, onApply }) {
           <button className="ar-scanbtn" onClick={() => inRef.current?.click()}>
             <span className="ic">▣</span> Scan, photo or PDF
           </button>
-          <p>Photograph the intake form, or pick a saved photo or an eligibility / authorization PDF.
-            Everything is read on this device — nothing is uploaded, and the document is not saved with
-            the case. You confirm every field before it is written in. One or several documents per
-            patient is fine; each one adds to the last.</p>
+          <p>Scan in turn: the <b>AHCCCS eligibility</b> screen (name, ID, DOB, gender, plan), the
+            <b>authorization summary</b> if there is one (auth number), and the <b>intake form</b>
+            (weight, height). Each adds to the last; you confirm every field before it is written in.
+            Everything is read on this device — nothing is uploaded, and the document is not saved with the case.</p>
         </div>
       )}
 
@@ -2591,13 +2592,14 @@ function ScanCard({ preop, onApply }) {
             {st.preview && <img className="ar-thumb big" src={st.preview} alt="" />}
             <div style={{ flex: 1 }}>
               <div className="ar-scanmsg">
-                {st.n ? `Found ${st.n} of ${SCAN_FIELDS.length} fields — check each against the document, then apply.`
-                      : "Couldn't pick out any fields. Try a straighter, brighter photo, or use the raw text below."}
+                <span className="ar-kind">{(st.kinds || []).join(" + ")}</span>
+                {st.n ? ` — found ${st.n} field(s). Check each against the document, then apply.`
+                      : " — couldn't pick out any fields. Try a straighter, brighter photo, or use the raw text below."}
               </div>
               <div className="ar-scangrid">
                 {SCAN_FIELDS.map(([k, label]) => {
                   const found = vals[k] != null && vals[k] !== "";
-                  const cur = k === "allergies" ? (preop.nkda ? "NKDA" : preop.allergies) : preop[k];
+                  const cur = preop[k];
                   const differs = found && cur && String(cur) !== String(vals[k]);
                   return (
                     <div key={k} className={`ar-scanf ${found ? "" : "miss"}`}>
