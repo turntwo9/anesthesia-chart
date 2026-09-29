@@ -141,6 +141,35 @@ const CSS = `
 .ar-derived .dl{display:flex; justify-content:space-between; font-size:12px; padding:3px 0}
 .ar-derived .dl span:last-child{font-family:'IBM Plex Mono',monospace; color:var(--co2)}
 .ar-derived .cap{font-size:9.5px; letter-spacing:.13em; text-transform:uppercase; color:var(--dim); margin-bottom:6px}
+/* ---- document scan ---- */
+.ar-scan{grid-column:1 / -1; border-left:2px solid var(--spo2)}
+.ar-scanrow{display:flex; gap:14px; align-items:center; flex-wrap:wrap}
+.ar-scanrow p{flex:1; min-width:240px; margin:0; font-size:11.5px; color:var(--muted); line-height:1.5}
+.ar-scanbtn{display:flex; align-items:center; gap:10px; padding:13px 20px; border-radius:2px;
+  background:var(--spo2); color:#04151E; font-size:12px; font-weight:700; letter-spacing:.1em; text-transform:uppercase}
+.ar-scanbtn .ic{font-size:16px; line-height:1}
+.ar-scanbtn:disabled{background:var(--panel2); color:var(--dim); cursor:not-allowed}
+.ar-scanmsg{font-size:12.5px; color:var(--ink); margin-bottom:8px}
+.ar-bar{height:6px; background:var(--panel2); border-radius:3px; overflow:hidden; max-width:420px}
+.ar-bar div{height:100%; background:var(--spo2); transition:width .25s ease}
+.ar-thumb{width:92px; height:92px; object-fit:cover; border-radius:2px; border:1px solid var(--line-hi); background:#000}
+.ar-thumb.big{width:150px; height:190px}
+.ar-scangrid{display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:8px 14px}
+.ar-scanf{display:flex; gap:8px; align-items:flex-start}
+.ar-scanf .ar-check{padding:8px 9px; margin-top:14px}
+.ar-scanf .ar-check:disabled{opacity:.35; cursor:default}
+.ar-scanf.miss{opacity:.7}
+.ar-scanfl{flex:1; min-width:0}
+.ar-scanfl label{display:block; font-size:9.5px; letter-spacing:.13em; text-transform:uppercase; color:var(--dim); margin-bottom:3px}
+.ar-scanfl label em{font-style:normal; text-transform:none; letter-spacing:0; color:var(--warn)}
+.ar-scanhint{font-size:10.5px; color:var(--warn); margin:-1px 0 4px; line-height:1.3}
+.ar-scanfl input,.ar-scanfl select{width:100%; background:var(--panel2); border:1px solid var(--line); border-radius:2px;
+  color:var(--ink); padding:7px 9px; font-size:13px; font-family:'IBM Plex Sans Condensed',sans-serif}
+.ar-scanfl input::placeholder{color:var(--dim); font-style:italic}
+.ar-scanacts{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; align-items:center}
+.ar-rawtext{margin:10px 0 0; padding:10px; background:var(--field); border:1px solid var(--line); border-radius:2px;
+  font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--muted); white-space:pre-wrap; max-height:220px; overflow:auto}
+
 .ar-handoff{grid-column:1 / -1; display:flex; gap:10px; align-items:center; flex-wrap:wrap}
 .ar-handoff button{padding:14px 26px; background:var(--spo2); color:#04151E; border-radius:2px;
   font-size:12px; font-weight:700; letter-spacing:.12em; text-transform:uppercase}
@@ -301,6 +330,8 @@ const CSS = `
   font-family:'IBM Plex Mono',monospace}
 .pr th{background:#efefef; font-family:'IBM Plex Sans Condensed',sans-serif; font-weight:600}
 .pr td.l,.pr th.l{text-align:left; font-family:'IBM Plex Sans Condensed',sans-serif; white-space:nowrap}
+.pr table.pr-grid{table-layout:fixed}
+.pr table.pr-grid td,.pr table.pr-grid th{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:1.5px 1px}
 .pr-toolbar{position:sticky; top:0; display:flex; gap:8px; padding:10px 0 14px; background:#fff}
 .pr-toolbar button{padding:9px 18px; border:1px solid #333; border-radius:2px; background:#111; color:#fff;
   font-size:11px; letter-spacing:.1em; text-transform:uppercase; font-weight:600; cursor:pointer}
@@ -1256,6 +1287,17 @@ function AnesthesiaRecord() {
 
       {view === "preop" ? (
         <div className="ar-preop">
+          <ScanCard preop={preop} onApply={(patch) => {
+            const p2 = { ...patch };
+            if ("allergies" in p2) {
+              if (/^nkda$/i.test(p2.allergies)) { p2.nkda = true; p2.allergies = ""; }
+              else p2.nkda = false;
+            }
+            setPreop((p) => ({ ...p, ...p2 }));
+            setIoMsg(`Filled ${Object.keys(patch).length} field(s) from the scanned document — review them before proceeding.`);
+            setTimeout(() => setIoMsg(null), 7000);
+          }} />
+
           <section className="ar-card">
             <h2>Patient</h2>
             <div className="ar-grid2">
@@ -2059,6 +2101,546 @@ const PLANS = ["Liberty", "Envolve", "UHC", "Health Choice", "AIHP", "Molina",
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
+/* ------------------------------------------------------------------ */
+/*  Document scan — OCR runs entirely in the browser (Tesseract.js).    */
+/*  The photo never leaves the device and is not saved with the case.  */
+/* ------------------------------------------------------------------ */
+
+// Tesseract is loaded only on first use so the app itself stays quick to open.
+let tessLoading = null;
+const loadTesseract = () => {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (tessLoading) return tessLoading;
+  tessLoading = new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+    s.onload = () => res(window.Tesseract);
+    s.onerror = () => { tessLoading = null; rej(new Error("Couldn't load the OCR engine — check the connection.")); };
+    document.head.appendChild(s);
+  });
+  return tessLoading;
+};
+
+// Downscale to a sane size and flatten to grayscale — both help OCR on phone photos.
+const prepImage = (file) => new Promise((res, rej) => {
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    const MAX = 2200;
+    const k = Math.min(1, MAX / Math.max(img.width, img.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+    const g = c.getContext("2d");
+    g.drawImage(img, 0, 0, c.width, c.height);
+    const d = g.getImageData(0, 0, c.width, c.height), px = d.data;
+    for (let i = 0; i < px.length; i += 4) {
+      // luminance, then a mild contrast stretch
+      let y = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+      y = Math.max(0, Math.min(255, (y - 128) * 1.25 + 128));
+      px[i] = px[i + 1] = px[i + 2] = y;
+    }
+    g.putImageData(d, 0, 0);
+    res({ canvas: c, preview: url });
+  };
+  img.onerror = () => { URL.revokeObjectURL(url); rej(new Error("That file isn't an image the browser can open.")); };
+  img.src = url;
+});
+
+const titleCase = (s) => s.replace(/\S+/g, (w) =>
+  /^(II|III|IV|MD|DDS|Jr\.?|Sr\.?)$/i.test(w) ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1).toLowerCase());
+
+const toISODate = (m, d, y) => {
+  let yy = Number(y);
+  if (y.length === 2) { const cur = new Date().getFullYear() % 100; yy = yy <= cur ? 2000 + yy : 1900 + yy; }
+  const mm = Number(m), dd = Number(d);
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return "";
+  return `${yy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+};
+
+// OCR confusions inside a date or an ID: O→0, S→5, I/l→1, B→8, Z→2, plus stray spaces
+const fixDigits = (s) => s.replace(/[Oo]/g, "0").replace(/[Il|!]/g, "1").replace(/S/g, "5")
+  .replace(/B/g, "8").replace(/Z/g, "2").replace(/[Qq]/g, "0").replace(/[Gg]/g, "6");
+const fixDate = (s) => s.replace(/[_~]/g, "")
+  .replace(/(\d{3})\s+(\d)(?!\d)/g, "$1$2")                                    // "202 2" → "2022"
+  .replace(/(\d{1,2})\s*([\/\-.])\s*(\d{1,2})\s*([\/\-.])\s*(\d)/g, "$1$2$3$4$5"); // "11 / 10 / 2019"
+
+// Turns raw OCR (or a PDF text layer) into candidate values for the preop fields.
+// Everything here is a best guess for the user to confirm — never applied silently.
+const extractFromText = (raw) => {
+  const text = raw.replace(/\r/g, "").replace(/[|]/g, "I");
+  const lines0 = text.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const out = {}, hints = {};
+
+  // ---- sections: values under a parent/guarantor heading belong to the adult, not the patient ----
+  const RP_HEAD = /^(RESPONSIBLE PARTY|PARENT|GUARDIAN|PARENT\s*\/\s*GUARDIAN|GUARANTOR|EMERGENCY CONTACT|INSURANCE HOLDER|SUBSCRIBER|POLICY ?HOLDER|ACCOUNT HOLDER)\b/i;
+  const PT_HEAD = /^(PATIENT INFORMATION|PATIENT|MEDICAL HISTORY|INSURANCE|MEMBER INFORMATION|SELECTED PATIENT|DENTAL HISTORY|MEDICATIONS?|ALLERGIES)\b/i;
+  let sec = "pt";
+  const secOf = lines0.map((l) => {
+    if (RP_HEAD.test(l)) sec = "rp"; else if (PT_HEAD.test(l)) sec = "pt";
+    return sec;
+  });
+  const lines = lines0;                                   // all lines
+  const ptLines = lines0.filter((_, i) => secOf[i] !== "rp");   // patient-side lines only
+
+  const STOP_SRC = "DOB|D[O0]B|Date of Birth|Birth ?date|Sex|Gender|ID\\b|Member|Plan\\b|Insurance|Auth\\w*|Weight|Wt\\b|Height|Ht\\b|NPO|Allerg\\w*|Medical History|PMH|Medications?|Meds\\b|Phone|Address|Name\\b|Provider|Dentist|Surgeon|Date of Service|DOS\\b|Signature|Consent|Age\\b|Nickname|Relationship|Effective|Expiration|Status|Type\\b|City|State|Zip|Last\\b|First\\b|Middle\\b";
+  const STOP = new RegExp("\\b(?:" + STOP_SRC + ")", "i");
+
+  const cleanRest = (rest) => {
+    rest = rest.replace(/^[\s:#.\-–—_]+/, "").trim();
+    if (new RegExp("^(?:" + STOP_SRC + ")", "i").test(rest)) return "";   // blank field, next label follows
+    const cut = rest.search(new RegExp("\\s(?=(?:" + STOP_SRC + "))", "i"));
+    if (cut > 0) rest = rest.slice(0, cut).trim();
+    return rest.replace(/[:\-–—_]+$/, "").trim();
+  };
+  const afterAllIn = (src, labelRe) => {
+    const found = [];
+    for (let i = 0; i < src.length; i++) {
+      const m = src[i].match(labelRe);
+      if (!m) continue;
+      let rest = cleanRest(src[i].slice(m.index + m[0].length));
+      const nx = src[i + 1] || "";
+      if (!rest && nx && !labelRe.test(nx) && !/\?/.test(nx) && !/^(is|are|does|do|has|have|please|date|signature)\b/i.test(nx)
+          && !new RegExp("^(?:" + STOP_SRC + ")", "i").test(nx)) rest = cleanRest(nx);
+      if (rest) found.push({ v: rest, line: src[i], i });
+    }
+    return found;
+  };
+  const afterAll = (labelRe, src = ptLines) => afterAllIn(src, labelRe).map((x) => x.v);
+  const after = (labelRe, src = ptLines) => afterAll(labelRe, src)[0] || "";
+
+  const HEADING = new RegExp("^(?:" + STOP_SRC + ")\\s*[:\\-–—]?", "i");
+  const blockAfter = (labelRe, src = ptLines, maxLines = 6) => {
+    for (let i = 0; i < src.length; i++) {
+      const m = src[i].match(labelRe);
+      if (!m) continue;
+      const first = src[i].slice(m.index + m[0].length).replace(/^[\s:#.\-–—_]+/, "").trim();
+      const acc = first ? [first] : [];
+      for (let j = i + 1; j < src.length && acc.length < maxLines; j++) {
+        if (HEADING.test(src[j])) break;
+        acc.push(src[j].replace(/^[-•*]\s*/, ""));
+      }
+      return acc.join("; ").replace(/;\s*;/g, ";").trim();
+    }
+    return "";
+  };
+
+  const NONE = /^\s*\(?\s*(n\s*\/?\s*[ai1l]\b|na\b|none\b|nil\b|neg(ative)?\b|denies\b|denied\b|nkda\b|nka\b|no known\b|—|-)/i;
+  const ORG = /\b(center|centre|clinic|dental|dentistry|orthodontics?|surgery|anesthesia|intake|form|pediatric|office|group|associates|llc|inc|health|care|plan|community|medicaid|ahcccs|eligib\w*|status|summary|information|number|provider|practitioner|location|address|ave|avenue|rd|road|st|street|blvd|suite|ste|phoenix|glendale|peoria|chandler|mesa|tempe|scottsdale|tucson|arizona|az\b|user|account|manuals?|menu|print|help|verification|enrollment|demographics|returned|requested|data|hub|determination|processed|service|details|quantity|amount|approved|denied|crown|tooth|primary|type|self|child|parent|mother|father|guardian|relationship|nickname|employer|home|cell|work|phone|signature|reviewed|date|today|physician|pediatrician|specialist|cardiologist|oncologist|neurologist|other|yes|no\b)\b/i;
+
+  // ---- name ----
+  const nameish = (s) => /^[A-Za-z][A-Za-z'’\-]+,?(?:\s+[A-Za-z][A-Za-z'’\-.]*){1,3}$/.test(s) && !STOP.test(s) && !ORG.test(s) && !/\d/.test(s);
+  const capsWord = (w) => (w === w.toUpperCase() && /[A-Z]{2,}/.test(w)) ? titleCase(w) : w;
+  const tidyName = (n) => n.replace(/\s+/g, " ").trim().split(" ").map(capsWord).join(" ")
+    .replace(/\s*,\s*/, ", ");
+  let name = "";
+  // (a) explicit patient/member name label — never "Name of Person/Relationship"
+  for (const c of afterAllIn(ptLines, /\b(Patient(?:'s)?\s*Name|Member\s*Name|Name(?: of Patient)?|(?:Patient|Member)\s*:)/i)) {
+    if (/relationship|person|\b(last|first|middle)\s*name/i.test(c.line)) continue;
+    const v = c.v.replace(/\b(DOB|Sex|Gender|Age)\b.*$/i, "").replace(/\d.*$/, "").trim();
+    if (v && nameish(v.replace(",", ""))) { name = v; break; }
+  }
+  // (b) split Last Name / First Name fields (state portal)
+  if (!name) {
+    const part = (re) => afterAll(re).map((v) => v.replace(/\d.*$/, "").trim())
+      .find((v) => v && /^[A-Za-z][A-Za-z'’\-]+(\s[A-Za-z][A-Za-z'’\-.]*){0,2}$/.test(v) && !ORG.test(v) && !STOP.test(v));
+    const last = part(/\bLast\s*Name\b/i), first = part(/\bFirst\s*Name\b/i);
+    if (last && first) name = `${last}, ${first}`;
+  }
+  // (c) header form "LAST FIRST, FIRST (A12345678-01)"
+  const hdr = text.match(/([A-Z][A-Za-z'’\-]+(?:\s+[A-Z][A-Za-z'’\-]+)*,\s*[A-Z][A-Za-z'’\-]+(?:\s+[A-Z][A-Za-z'’\-]+)?)\s*\(\s*([A-Z]?[0-9OSIlB]{6,}(?:-\d{1,2})?)\s*\)/);
+  if (!name && hdr) name = hdr[1];
+  // (d) a name-shaped line right after a "Member" / "Patient" heading, or anywhere as a last resort
+  if (!name) {
+    const near = [];
+    ptLines.forEach((l, i) => {
+      if (/^(Member|Patient|Selected Patient|Subscriber|Recipient)\s*:?$/i.test(l))
+        for (let k = 1; k <= 3 && ptLines[i + k]; k++) near.push(ptLines[i + k]);
+    });
+    name = near.find(nameish) || ptLines.find((l) => nameish(l) && l.split(" ").length <= 3 && /[A-Z]{2,}/.test(l)) || "";
+  }
+  if (name) out.name = tidyName(name);
+
+  // ---- date of birth ----
+  const DOBL = /\b(Date\s*of\s*Birth|D\W{0,4}[O0Q]\W{0,3}B|Birth\s*date|Birthdate|Birth\s*Date)\b/i;
+  const DCH = "[0-9OoSIl!|BZQ]";
+  const dateIn = (s) => {
+    const w = fixDate(s.slice(0, 40));
+    const tok = w.match(new RegExp(DCH + "{1,2}[\\/\\-.]" + DCH + "{1,2}[\\/\\-.]" + DCH + "{2,4}(?![0-9])"));
+    if (tok) {
+      const m = fixDigits(tok[0]).match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})$/);
+      if (m) return toISODate(m[1], m[2], m[3]);
+    }
+    // label badly mangled by OCR: take the digits up to the next real word — 8 digits reads MMDDYYYY
+    const upto = w.split(/\s[A-Za-z]{3,}/)[0];
+    const d = fixDigits(upto).replace(/\D/g, "");
+    if (d.length === 8) return toISODate(d.slice(0, 2), d.slice(2, 4), d.slice(4));
+    if (d.length === 6) return toISODate(d.slice(0, 2), d.slice(2, 4), d.slice(4));
+    return "";
+  };
+  const dobCands = [];
+  ptLines.forEach((l) => {
+    let m; const re = new RegExp(DOBL.source, "gi");
+    while ((m = re.exec(l))) {
+      const iso = dateIn(l.slice(m.index + m[0].length));
+      if (iso) dobCands.push({ iso, strong: /date\s*of\s*birth|d\s*[o0q]\s*b/i.test(m[0]) });
+    }
+  });
+  const pick = dobCands.find((c) => c.strong) || dobCands[0];
+  if (pick) {
+    out.dob = pick.iso;
+    const yrs = (Date.now() - new Date(pick.iso + "T00:00:00")) / 3.156e10;
+    const ageOnForm = (after(/\bAge\b/i).match(/^\d{1,2}/) || [])[0];
+    if (yrs > 21) hints.dob = "reads as an adult — confirm this is the patient's, not a parent's";
+    else if (ageOnForm && Math.abs(Number(ageOnForm) - yrs) > 1.5) hints.dob = `form says age ${ageOnForm} — check the year`;
+  }
+
+  // ---- gender ----
+  const sx = after(/\b(Sex|Gender)\b/i);
+  if (/^f/i.test(sx) || /\bfemale\b/i.test(ptLines.join(" "))) out.sex = "Female";
+  else if (/^m/i.test(sx) || /\bmale\b/i.test(ptLines.join(" "))) out.sex = "Male";
+  if (!out.sex) {
+    const dl = ptLines.find((l) => DOBL.test(l)) || "";
+    const lone = dl.match(/\b([MF])\b\s*$/) || dl.match(/\d{4}\s+([MF])\b/);
+    if (lone) out.sex = lone[1] === "F" ? "Female" : "Male";
+  }
+
+  // ---- ID number: Member #, Member ID, AHCCCS ID, and friends ----
+  const normId = (t) => {
+    t = t.replace(/\s+/g, "");
+    // AHCCCS style: a letter then 8 digits, optional -NN suffix — repair OCR letters in the digit run
+    const a = t.match(/^([A-Za-z])([A-Za-z0-9]{8})(-\d{1,2})?$/);
+    if (a) return (a[1] + fixDigits(a[2]) + (a[3] || "")).toUpperCase();
+    return t.toUpperCase();
+  };
+  const idFrom = (cands, minDigits) => {
+    for (const v of cands) {
+      if (/https?:|=/.test(v)) continue;
+      // a short prefix OCR split off the number ("A0 260828159370") is rejoined; otherwise no spaces
+      const t = v.match(/\b[A-Z]{0,2}[0-9OSIlB]{1,2}\s[0-9OSIlB]{4,}\b/)
+             || v.match(/\b[A-Z]{0,2}[0-9OSIlB][0-9A-Z\-]{3,}\b/i);
+      if (!t) continue;
+      const n = normId(t[0].trim());
+      if ((n.match(/\d/g) || []).length >= minDigits) return n;
+    }
+    return null;
+  };
+  const ID_L = /\b(Member\s*(?:ID|#|No\.?|Number)|AHCCCS\s*(?:ID|#|No\.?|Number)?|Medicaid\s*(?:ID|#|Number)|Subscriber\s*(?:ID|#|Number)|Recipient\s*(?:ID|#)|Patient\s*ID|Insurance\s*ID|ID\s*(?:Number|No\.?|#)|ID)\b/i;
+  out.idNum = idFrom(afterAll(ID_L), 5) || (hdr ? normId(hdr[2]) : null)
+    || (() => { const g = text.match(/\b[A][0-9OSIlB]{8}\b/); return g ? normId(g[0]) : null; })() || undefined;
+  if (!out.idNum) delete out.idNum;
+
+  // ---- authorization number ----
+  const AU_L = /\b(Prior\s*Auth(?:orization)?(?:\s*(?:Number|No\.?|#|ID))?|Auth(?:orization)?\s*(?:Number|No\.?|#|ID)|Authorization|Auth|PA\s*#|Reference\s*(?:Number|#))\b/i;
+  const au = idFrom(afterAll(AU_L, lines), 4);
+  if (au && au !== out.idNum) out.authNum = au;
+
+  // ---- plan: the practice's list, with the names each payer shows up under ----
+  const PLAN_ALIASES = [
+    ["DCS / Liberty", /\bDCS\b.*\b(Liberty|Mercy\s*Care)\b|\b(Liberty|Mercy\s*Care)\b.*\bDCS\b/i],
+    ["DCS / UHC", /\bDCS\b.*\b(UHC|United\s*Health|APIPA)|\b(UHC|United\s*Health|APIPA)\w*.*\bDCS\b/i],
+    ["Liberty", /\b(Liberty|Mercy\s*Care)\b/i],
+    ["UHC", /\b(UHC|United\s*Health(?:\s*Care|care)?|UnitedHealthcare|APIPA\w*)\b/i],
+    ["DentaQuest", /\b(Denta\s*Quest|Banner)\b/i],
+    ["Health Choice", /\bHealth\s*Choice\b/i],
+    ["AIHP", /\bAIHP\b/i],
+    ["Molina", /\bMolina\b/i],
+    ["Envolve", /\bEnvolve\b/i],
+    ["Care 1st", /\bCare\s*1st\b/i],
+    ["FFS", /\b(FFS|Fee[\s\-]*for[\s\-]*Service)\b/i],
+  ];
+  for (const [plan, re] of PLAN_ALIASES) { if (re.test(text)) { out.plan = plan; break; } }
+
+  // ---- weight / height ----
+  const num = (s) => { const m = (s || "").match(/(\d{1,3}(?:\.\d+)?)/); return m ? parseFloat(m[1]) : null; };
+  const wLab = after(/\b(Weight|Wt)\b(?!\s*\()/i);
+  const wkg = text.match(/(\d{1,3}(?:\.\d+)?)\s*(?:kg|kgs|kilograms?)\b/i);
+  const wlb = text.match(/(\d{1,3}(?:\.\d+)?)\s*(?:lb|lbs|pounds?|#)\b/i);
+  if (wkg) out.kg = String(Math.round(parseFloat(wkg[1]) * 10) / 10);
+  else if (wlb) { out.kg = String(Math.round(parseFloat(wlb[1]) * 0.45359 * 10) / 10); hints.kg = `read as ${wlb[1]} lb`; }
+  else if (num(wLab) != null && num(wLab) > 0) {
+    const w = num(wLab);
+    out.kg = String(Math.round(w * 0.45359 * 10) / 10);
+    hints.kg = `form shows ${w} with no unit — taken as lb → ${out.kg} kg`;
+  }
+  const hft = text.match(/(\d)\s*['’]\s*(\d{1,2})\s*(?:"|”|''|in)?/);
+  const hin = text.match(/(\d{2,3}(?:\.\d+)?)\s*(?:in|inch|inches|")\b/i);
+  const hcm = text.match(/(\d{2,3}(?:\.\d+)?)\s*(?:cm|centimeters?)\b/i);
+  const hLab = after(/\b(Height|Ht)\b(?!\s*\()/i);
+  if (hft) out.heightIn = String(Number(hft[1]) * 12 + Number(hft[2]));
+  else if (hin) out.heightIn = hin[1];
+  else if (hcm) out.heightIn = String(Math.round(parseFloat(hcm[1]) / 2.54 * 10) / 10);
+  else if (num(hLab) != null && num(hLab) > 0) {
+    const h = num(hLab);
+    if (h > 90) { out.heightIn = String(Math.round(h / 2.54 * 10) / 10); hints.heightIn = `form shows ${h} with no unit — taken as cm`; }
+    else { out.heightIn = String(h); hints.heightIn = `form shows ${h} with no unit — taken as inches`; }
+  }
+
+  // ---- NPO ----
+  const TIME = "(\\d{4}(?!\\d)\\s*(?:hrs?)?|\\d{1,2}(?::\\d{2})?\\s*(?:a\\.?m\\.?|p\\.?m\\.?)|\\d{1,2}:\\d{2}|midnight|\\bMN\\b)";
+  const tidyTime = (t) => {
+    t = t.trim().replace(/\bMN\b|midnight/i, "Midnight").replace(/\s*hrs?$/i, "");
+    const mil = t.match(/^(\d{2})(\d{2})$/);
+    return mil ? `${mil[1]}:${mil[2]}` : t.replace(/\s+/g, " ").toUpperCase().replace("MIDNIGHT", "Midnight");
+  };
+  const npoText = lines.filter((l) => /\bNPO\b/i.test(l)).join("  ");
+  const npoS = npoText.match(new RegExp("(?:solids?|food|meals?)\\s*[:\\-–—]?\\s*(?:at|since|@)?\\s*" + TIME, "i"));
+  const npoC = npoText.match(new RegExp("(?:clears?|clear\\s*liquids?|liquids?|fluids?)\\s*[:\\-–—]?\\s*(?:at|since|@)?\\s*" + TIME, "i"));
+  if (npoS) out.npoSolids = tidyTime(npoS[1]);
+  if (npoC) out.npoClears = tidyTime(npoC[1]);
+  if (!npoS && !npoC && npoText) {
+    const any = npoText.match(new RegExp("NPO\\s*(?:since|at|after|@|from)?\\s*[:\\-–—]?\\s*" + TIME, "i"));
+    if (any) out.npoSolids = tidyTime(any[1]);
+  }
+
+  // ---- medical history ----
+  // a Y/N checklist reads as noise; the free-text "discuss any medical problems" line is the signal
+  const CHECKLIST = /\b(latex|asthma|hemophilia|tuberculosis|mastocytosis|autism|diabetes|down syndrome|cerebral palsy|sickle cell|malignant hyperthermia|seizure|epilepsy|heart murmur|pregnant)\b/i;
+  const isChecklist = (s) => (s.match(CHECKLIST) || []).length >= 1 && /\b[YN]\b/.test(s) || (s.match(new RegExp(CHECKLIST.source, "gi")) || []).length >= 3;
+  let pmh = after(/\b(?:discuss|describe|list|explain)\s+(?:any|all)?\s*(?:medical\s+)?(?:problems|conditions|history|illnesses)[^:]*/i);
+  if (!pmh) pmh = blockAfter(/\b(Past\s*Medical\s*History|PMH)\b/i);
+  if (!pmh) {
+    const b = blockAfter(/\b(Medical\s*History|Hx|History)\b/i);
+    if (b && !isChecklist(b) && !/has your child|following medical/i.test(b)) pmh = b;
+  }
+  if (pmh) out.pmh = NONE.test(pmh) ? "None" : pmh.replace(/;\s*$/, "");
+
+  // ---- medications: "current medications" beats a checklist line that merely mentions them ----
+  let meds = after(/\b(?:list\s+all\s+)?current\s+medications?\b[^:]*/i)
+          || after(/\b(?:list\s+all\s+medications?)\b[^:]*/i)
+          || blockAfter(/^(?:Medications?|Meds)\b/i);
+  if (!meds) {
+    const c = afterAllIn(ptLines, /\b(Medications?|Meds)\b/i).find((x) => !/allerg|please list below|\(.*\)$/i.test(x.line));
+    if (c) meds = c.v;
+  }
+  if (meds) out.meds = NONE.test(meds) ? "None" : meds;
+
+  // ---- allergies: "N/A" or "NKDA" means no known drug allergies ----
+  const alC = afterAllIn(ptLines, /\b(?:list\s+all\s+)?allerg(?:y|ies)\b(?:\s*\([^)]*\))?/i)
+    .find((x) => !/\bto\s+(latex|medications?)\b|please list below/i.test(x.line) && x.v && !/^\(/.test(x.v));
+  if (alC) out.allergies = NONE.test(alC.v) ? "NKDA" : alC.v.replace(/\bmedicine,?\s*food,?\s*latex,?\s*etc\.?\)?:?\s*/i, "").trim();
+  else if (/\bNKDA\b/i.test(text)) out.allergies = "NKDA";
+
+  Object.keys(out).forEach((k) => { if (out[k] == null || out[k] === "") delete out[k]; });
+  return { fields: out, hints };
+};
+
+const SCAN_FIELDS = [
+  ["name", "Patient name"], ["dob", "Date of birth"], ["idNum", "ID number"], ["plan", "Plan"],
+  ["authNum", "Authorization number"], ["sex", "Gender"], ["kg", "Weight (kg)"], ["heightIn", "Height (in)"],
+  ["npoSolids", "NPO solids"], ["npoClears", "NPO clears"], ["allergies", "Allergies"],
+  ["pmh", "Medical history"], ["meds", "Medications"],
+];
+
+// pdf.js, loaded on first PDF. Eligibility and authorization printouts saved as PDF
+// usually carry a text layer, which reads exactly — OCR is only the fallback.
+let pdfLoading = null;
+const loadPdfJs = () => {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (pdfLoading) return pdfLoading;
+  const base = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/";
+  pdfLoading = new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = base + "pdf.min.js";
+    s.onload = () => { window.pdfjsLib.GlobalWorkerOptions.workerSrc = base + "pdf.worker.min.js"; res(window.pdfjsLib); };
+    s.onerror = () => { pdfLoading = null; rej(new Error("Couldn't load the PDF reader — check the connection.")); };
+    document.head.appendChild(s);
+  });
+  return pdfLoading;
+};
+
+// Each page → { text (from the text layer, lines rebuilt from positions), canvas (for OCR / preview) }
+const readPdf = async (file, maxPages = 4) => {
+  const pdfjs = await loadPdfJs();
+  const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+  const pages = [];
+  for (let n = 1; n <= Math.min(pdf.numPages, maxPages); n++) {
+    const page = await pdf.getPage(n);
+    const tc = await page.getTextContent();
+    const rows = [];
+    tc.items.filter((it) => it.str && it.str.trim()).forEach((it) => {
+      const y = it.transform[5], x = it.transform[4];
+      let row = rows.find((r) => Math.abs(r.y - y) <= 3);
+      if (!row) rows.push(row = { y, items: [] });
+      row.items.push({ x, s: it.str });
+    });
+    rows.sort((a, b) => b.y - a.y);
+    const text = rows.map((r) => r.items.sort((a, b) => a.x - b.x).map((i) => i.s).join(" ")).join("\n");
+    const vp = page.getViewport({ scale: 2 });
+    const canvas = document.createElement("canvas");
+    canvas.width = vp.width; canvas.height = vp.height;
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+    pages.push({ text, canvas });
+  }
+  return pages;
+};
+
+function ScanCard({ preop, onApply }) {
+  const [st, setSt] = useState({ phase: "idle" });   // idle | working | review | error
+  const [vals, setVals] = useState({});
+  const [hints, setHints] = useState({});
+  const [use, setUse] = useState({});
+  const [showText, setShowText] = useState(false);
+  const inRef = useRef(null);
+
+  const ocr = async (canvas, onProgress) => {
+    const T = await loadTesseract();
+    const worker = await T.createWorker("eng", 1, {
+      logger: (m) => { if (m.status === "recognizing text") onProgress(m.progress); },
+    });
+    const { data } = await worker.recognize(canvas);
+    await worker.terminate();
+    return data.text || "";
+  };
+
+  const run = async (file) => {
+    if (!file) return;
+    setSt({ phase: "working", msg: "Preparing…", pct: 0 });
+    let preview = null;
+    try {
+      let text = "";
+      const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+      if (isPdf) {
+        setSt({ phase: "working", msg: "Opening PDF…", pct: 3 });
+        const pages = await readPdf(file);
+        preview = pages[0].canvas.toDataURL("image/jpeg", 0.6);
+        for (let i = 0; i < pages.length; i++) {
+          const pg = pages[i];
+          if (pg.text.replace(/\s/g, "").length >= 60) {
+            text += pg.text + "\n";                       // real text layer: exact, no OCR needed
+            setSt({ phase: "working", msg: `Reading page ${i + 1} text…`, pct: 10 + Math.round(((i + 1) / pages.length) * 90), preview });
+          } else {
+            setSt({ phase: "working", msg: `Page ${i + 1} is an image — reading it…`, pct: 10, preview });
+            text += await ocr(pg.canvas, (p) => setSt((s) => ({ ...s, pct: 10 + Math.round(((i + p) / pages.length) * 90) }))) + "\n";
+          }
+        }
+      } else {
+        const { canvas, preview: p } = await prepImage(file);
+        preview = p;
+        setSt({ phase: "working", msg: "Loading OCR engine…", pct: 5, preview });
+        text = await ocr(canvas, (p) => setSt((s) => ({ ...s, msg: "Reading document…", pct: 10 + Math.round(p * 90) })));
+      }
+      const { fields: found, hints: h } = extractFromText(text);
+      // a second document adds to what the first found rather than replacing it
+      setVals((prev) => ({ ...prev, ...found }));
+      setHints((prev) => ({ ...prev, ...h }));
+      setUse((prev) => ({ ...prev, ...Object.fromEntries(Object.keys(found).map((k) => [k, true])) }));
+      setSt((s) => {
+        if (s.preview && s.preview !== preview && s.preview.startsWith("blob:")) URL.revokeObjectURL(s.preview);
+        return { phase: "review", preview, text: ((s.text || "") + "\n\n" + text).trim(), n: Object.keys(found).length };
+      });
+    } catch (e) {
+      setSt({ phase: "error", msg: e.message || String(e), preview });
+    }
+  };
+
+  const apply = () => {
+    const patch = {};
+    SCAN_FIELDS.forEach(([k]) => { if (use[k] && vals[k] != null && vals[k] !== "") patch[k] = vals[k]; });
+    onApply(patch);
+    reset();
+  };
+  const reset = () => {
+    if (st.preview && st.preview.startsWith("blob:")) URL.revokeObjectURL(st.preview);
+    setSt({ phase: "idle" }); setVals({}); setHints({}); setUse({}); setShowText(false);
+  };
+
+  return (
+    <section className="ar-card ar-scan">
+      <h2>Scan patient documentation</h2>
+      {/* no `capture` attribute: on iPad that offers Take Photo / Photo Library / Files
+          rather than forcing the camera, so a saved photo or a PDF screenshot works too */}
+      <input ref={inRef} type="file" accept="image/*,application/pdf,.pdf" style={{ display: "none" }}
+        onChange={(e) => { run(e.target.files?.[0]); e.target.value = ""; }} />
+
+      {st.phase === "idle" && (
+        <div className="ar-scanrow">
+          <button className="ar-scanbtn" onClick={() => inRef.current?.click()}>
+            <span className="ic">▣</span> Scan, photo or PDF
+          </button>
+          <p>Photograph the intake form, or pick a saved photo or an eligibility / authorization PDF.
+            Everything is read on this device — nothing is uploaded, and the document is not saved with
+            the case. You confirm every field before it is written in. One or several documents per
+            patient is fine; each one adds to the last.</p>
+        </div>
+      )}
+
+      {st.phase === "working" && (
+        <div className="ar-scanrow">
+          {st.preview && <img className="ar-thumb" src={st.preview} alt="" />}
+          <div style={{ flex: 1 }}>
+            <div className="ar-scanmsg">{st.msg}</div>
+            <div className="ar-bar"><div style={{ width: `${st.pct || 0}%` }} /></div>
+            <div className="ar-hint" style={{ padding: "6px 0 0" }}>First scan on a device downloads the
+              language data (a few MB); later scans are faster.</div>
+          </div>
+        </div>
+      )}
+
+      {st.phase === "error" && (
+        <div className="ar-scanrow">
+          <div style={{ flex: 1 }}>
+            <div className="ar-scanmsg" style={{ color: "var(--crit)" }}>{st.msg}</div>
+          </div>
+          <button className="ar-tg" onClick={reset}>Try again</button>
+        </div>
+      )}
+
+      {st.phase === "review" && (
+        <>
+          <div className="ar-scanrow" style={{ alignItems: "flex-start" }}>
+            {st.preview && <img className="ar-thumb big" src={st.preview} alt="" />}
+            <div style={{ flex: 1 }}>
+              <div className="ar-scanmsg">
+                {st.n ? `Found ${st.n} of ${SCAN_FIELDS.length} fields — check each against the document, then apply.`
+                      : "Couldn't pick out any fields. Try a straighter, brighter photo, or use the raw text below."}
+              </div>
+              <div className="ar-scangrid">
+                {SCAN_FIELDS.map(([k, label]) => {
+                  const found = vals[k] != null && vals[k] !== "";
+                  const cur = k === "allergies" ? (preop.nkda ? "NKDA" : preop.allergies) : preop[k];
+                  const differs = found && cur && String(cur) !== String(vals[k]);
+                  return (
+                    <div key={k} className={`ar-scanf ${found ? "" : "miss"}`}>
+                      <button className={`ar-check ${use[k] ? "on" : ""}`} role="checkbox" aria-checked={!!use[k]}
+                        disabled={!found} onClick={() => setUse((u) => ({ ...u, [k]: !u[k] }))}>
+                        <i />
+                      </button>
+                      <div className="ar-scanfl">
+                        <label>{label}{differs && <em> · will replace “{String(cur).slice(0, 24)}”</em>}</label>
+                        {hints[k] && <div className="ar-scanhint">{hints[k]}</div>}
+                        {k === "plan"
+                          ? <select value={vals[k] ?? ""} onChange={(e) => { setVals((v) => ({ ...v, [k]: e.target.value })); setUse((u) => ({ ...u, [k]: !!e.target.value })); }}>
+                              <option value="">—</option>{PLANS.map((p) => <option key={p} value={p}>{p}</option>)}
+                            </select>
+                          : k === "sex"
+                          ? <select value={vals[k] ?? ""} onChange={(e) => { setVals((v) => ({ ...v, [k]: e.target.value })); setUse((u) => ({ ...u, [k]: !!e.target.value })); }}>
+                              <option value="">—</option><option>Male</option><option>Female</option>
+                            </select>
+                          : <input value={vals[k] ?? ""} placeholder={found ? "" : "not found"}
+                              onChange={(e) => { setVals((v) => ({ ...v, [k]: e.target.value })); setUse((u) => ({ ...u, [k]: !!e.target.value })); }} />}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+          <div className="ar-scanacts">
+            <button className="ar-scanbtn" onClick={apply}
+              disabled={!SCAN_FIELDS.some(([k]) => use[k] && vals[k])}>
+              Apply {SCAN_FIELDS.filter(([k]) => use[k] && vals[k]).length} field(s) to preop
+            </button>
+            <button className="ar-tg" onClick={() => inRef.current?.click()}>Scan another page</button>
+            <button className="ar-tg" onClick={() => setShowText((x) => !x)}>{showText ? "Hide" : "Show"} raw text</button>
+            <button className="ar-tg" onClick={reset}>Discard</button>
+          </div>
+          {showText && <pre className="ar-rawtext">{st.text}</pre>}
+        </>
+      )}
+    </section>
+  );
+}
+
 function DobPicker({ v, on }) {
   const [yy = "", mm = "", dd = ""] = (v || "").split("-");
   const thisYear = new Date().getFullYear();
@@ -2193,8 +2775,18 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
   const rows = Object.entries(vitals).map(([t, v]) => ({ t: +t, ...v }))
     .filter((r) => cols.includes(r.t)).sort((a, b) => a.t - b.t);
 
-  const GW = 88, CW = 34, GHp = 150;
+  // One column geometry shared by every table and the graph, expressed as
+  // percentages of the same full width, so the printed columns line up exactly.
+  const LW = 78, TW = 26, WW = 26, CW = 34, GHp = 150;
+  const GW = LW + TW + WW;                       // where the time columns start
   const W = GW + cols.length * CW, yv = (v) => GHp - (v / 240) * GHp;
+  const pct = (x) => `${(x / W) * 100}%`;
+  const ColGroup = () => (
+    <colgroup>
+      <col style={{ width: pct(LW) }} /><col style={{ width: pct(TW) }} /><col style={{ width: pct(WW) }} />
+      {cols.map((t) => <col key={t} style={{ width: pct(CW) }} />)}
+    </colgroup>
+  );
   const medRows = [...DRUGS, ...extras.filter((x) => x.name)];
 
   const downloadForPrint = () => {
@@ -2325,7 +2917,8 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
       </div>
 
       <h2>Medications, gases &amp; fluids</h2>
-      <table>
+      <table className="pr-grid">
+        <ColGroup />
         <thead>
           <tr>
             <th className="l">Agent / drug</th><th>Total</th><th>Waste</th>
@@ -2345,7 +2938,8 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
       </table>
 
       <h2>Vitals</h2>
-      <table>
+      <table className="pr-grid">
+        <ColGroup />
         <thead>
           <tr>
             <th className="l">Value</th><th></th><th></th>
@@ -2365,7 +2959,9 @@ function PrintSheet({ preop: P, vitals, doses, waste, totals, extras, events, co
       </table>
 
       <h2>Blood pressure &amp; heart rate</h2>
-      <svg viewBox={`0 0 ${W} ${GHp}`} style={{ width: "100%", border: "1px solid #ccc" }}>
+      <svg viewBox={`0 0 ${W} ${GHp}`} preserveAspectRatio="none"
+        style={{ width: "100%", height: `${GHp * 1.15}px`, border: "1px solid #ccc", display: "block" }}>
+        <line x1={GW} x2={GW} y1="0" y2={GHp} stroke="#bbb" strokeWidth="0.6" />
         {[0, 40, 80, 120, 160, 200, 240].map((v) => (
           <g key={v}>
             <line x1={GW} x2={W} y1={yv(v)} y2={yv(v)} stroke="#ddd" strokeWidth="0.6" />
