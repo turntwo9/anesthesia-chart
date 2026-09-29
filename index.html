@@ -2117,30 +2117,67 @@ const loadTesseract = () => {
   return tessLoading;
 };
 
-// Downscale to a sane size and flatten to grayscale — both help OCR on phone photos.
-const prepImage = (file) => new Promise((res, rej) => {
-  const url = URL.createObjectURL(file);
-  const img = new Image();
-  img.onload = () => {
-    const MAX = 2200;
-    const k = Math.min(1, MAX / Math.max(img.width, img.height));
-    const c = document.createElement("canvas");
-    c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
-    const g = c.getContext("2d");
-    g.drawImage(img, 0, 0, c.width, c.height);
-    const d = g.getImageData(0, 0, c.width, c.height), px = d.data;
-    for (let i = 0; i < px.length; i += 4) {
-      // luminance, then a mild contrast stretch
-      let y = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
-      y = Math.max(0, Math.min(255, (y - 128) * 1.25 + 128));
-      px[i] = px[i + 1] = px[i + 2] = y;
+// Clean a page image for OCR: grayscale, then an adaptive (local) threshold so a shadow
+// across half the page or a dim corner doesn't swallow the text the way a single global
+// threshold would. Works in place on the canvas.
+const binarize = (c) => {
+  const w = c.width, h = c.height, g = c.getContext("2d");
+  const d = g.getImageData(0, 0, w, h), px = d.data;
+  const gray = new Uint8ClampedArray(w * h);
+  for (let i = 0, j = 0; i < px.length; i += 4, j++)
+    gray[j] = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+  // integral image for fast local means (Bradley–Roth)
+  const integ = new Uint32Array((w + 1) * (h + 1));
+  for (let y = 1; y <= h; y++) {
+    let rowSum = 0;
+    for (let x = 1; x <= w; x++) {
+      rowSum += gray[(y - 1) * w + (x - 1)];
+      integ[y * (w + 1) + x] = integ[(y - 1) * (w + 1) + x] + rowSum;
     }
-    g.putImageData(d, 0, 0);
-    res({ canvas: c, preview: url });
-  };
-  img.onerror = () => { URL.revokeObjectURL(url); rej(new Error("That file isn't an image the browser can open.")); };
-  img.src = url;
-});
+  }
+  const win = Math.max(15, Math.round(Math.min(w, h) / 24)), half = win >> 1, T = 0.12;
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - half), y1 = Math.min(h - 1, y + half);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - half), x1 = Math.min(w - 1, x + half);
+      const n = (x1 - x0 + 1) * (y1 - y0 + 1);
+      const sum = integ[(y1 + 1) * (w + 1) + (x1 + 1)] - integ[y0 * (w + 1) + (x1 + 1)]
+                - integ[(y1 + 1) * (w + 1) + x0] + integ[y0 * (w + 1) + x0];
+      const v = gray[y * w + x] * n < sum * (1 - T) ? 0 : 255;
+      const i = (y * w + x) * 4;
+      px[i] = px[i + 1] = px[i + 2] = v; px[i + 3] = 255;
+    }
+  }
+  g.putImageData(d, 0, 0);
+  return c;
+};
+
+// Decode a photo honouring its EXIF rotation (iPad photos are often stored sideways),
+// scale it to ~300 dpi for a letter page, and clean it for OCR.
+const OCR_MAX = 3000;
+const prepImage = async (file) => {
+  const url = URL.createObjectURL(file);
+  let bmp;
+  try {
+    bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+  } catch {
+    bmp = await new Promise((res, rej) => {
+      const img = new Image();
+      img.onload = () => res(img);
+      img.onerror = () => rej(new Error("That file isn't an image the browser can open."));
+      img.src = url;
+    });
+  }
+  const iw = bmp.width, ih = bmp.height;
+  const k = Math.min(OCR_MAX / Math.max(iw, ih), 2.5);       // upscale small photos, cap huge ones
+  const c = document.createElement("canvas");
+  c.width = Math.round(iw * k); c.height = Math.round(ih * k);
+  const g = c.getContext("2d");
+  g.imageSmoothingQuality = "high";
+  g.drawImage(bmp, 0, 0, c.width, c.height);
+  if (bmp.close) bmp.close();
+  return { canvas: binarize(c), preview: url };
+};
 
 const titleCase = (s) => s.replace(/\S+/g, (w) =>
   /^(II|III|IV|MD|DDS|Jr\.?|Sr\.?)$/i.test(w) ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1).toLowerCase());
@@ -2169,6 +2206,38 @@ const DOC_KINDS = {
   intake: { label: "Patient intake form", take: ["kg", "heightIn"] },
   other:  { label: "Other document", take: ["name", "dob", "sex", "idNum", "plan", "authNum", "kg", "heightIn", "npoSolids", "npoClears"] },
 };
+// Does a value look right for its field? Used to decide whether a second read is needed
+// and, when two reads disagree, which one to keep.
+const fieldOk = (k, v) => {
+  if (v == null || v === "") return false;
+  switch (k) {
+    case "idNum":   return /^[A-Z]\d{8}(-\d{1,2})?$/.test(v) || /\d{6,}/.test(v);
+    case "authNum": return (v.match(/\d/g) || []).length >= 8;
+    case "dob": {
+      const d = new Date(v + "T00:00:00"), yrs = (Date.now() - d) / 3.156e10;
+      return !isNaN(d) && yrs >= 0 && yrs < 100;
+    }
+    case "name":    return /^[A-Za-z][A-Za-z'’\-]+,? [A-Za-z]/.test(v) && !/[■?*]/.test(v);
+    case "sex":     return v === "Male" || v === "Female";
+    case "plan":    return PLANS.includes(v);
+    case "kg":      return Number(v) > 1 && Number(v) < 250;
+    case "heightIn":return Number(v) > 10 && Number(v) < 90;
+    default:        return true;
+  }
+};
+// Merge two reads of the same document: keep the first read's value when it passes,
+// otherwise take the second's when that one passes, otherwise whichever exists.
+const mergeReads = (a, b) => {
+  const fields = { ...a.fields }, hints = { ...a.hints };
+  const keys = new Set([...Object.keys(a.fields), ...Object.keys(b.fields)]);
+  keys.forEach((k) => {
+    const va = a.fields[k], vb = b.fields[k];
+    if (fieldOk(k, va)) return;
+    if (fieldOk(k, vb) || (va == null && vb != null)) { fields[k] = vb; if (b.hints[k]) hints[k] = b.hints[k]; else delete hints[k]; }
+  });
+  return { fields, hints, kind: a.kind !== "other" ? a.kind : b.kind };
+};
+
 const detectKind = (text) => {
   if (/Authorization\s*(Number|Summary)/i.test(text)) return "auth";
   if (/AHCCCS\s*ID|Member\s*Eligibility\s*Verification|Health\s*Plan\s*ID|Returned\s*Data/i.test(text)) return "ahcccs";
@@ -2465,7 +2534,7 @@ const readPdf = async (file, maxPages = 4) => {
     });
     rows.sort((a, b) => b.y - a.y);
     const text = rows.map((r) => r.items.sort((a, b) => a.x - b.x).map((i) => i.s).join(" ")).join("\n");
-    const vp = page.getViewport({ scale: 2 });
+    const vp = page.getViewport({ scale: 4 });      // ~290 dpi for a letter page
     const canvas = document.createElement("canvas");
     canvas.width = vp.width; canvas.height = vp.height;
     await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
@@ -2487,6 +2556,7 @@ function ScanCard({ preop, onApply }) {
     const worker = await T.createWorker("eng", 1, {
       logger: (m) => { if (m.status === "recognizing text") onProgress(m.progress); },
     });
+    await worker.setParameters({ preserve_interword_spaces: "1" });
     const { data } = await worker.recognize(canvas);
     await worker.terminate();
     return data.text || "";
@@ -2499,27 +2569,39 @@ function ScanCard({ preop, onApply }) {
     try {
       let text = "";
       const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+      let result;
       if (isPdf) {
         setSt({ phase: "working", msg: "Opening PDF…", pct: 3 });
         const pages = await readPdf(file);
         preview = pages[0].canvas.toDataURL("image/jpeg", 0.6);
-        for (let i = 0; i < pages.length; i++) {
-          const pg = pages[i];
-          if (pg.text.replace(/\s/g, "").length >= 60) {
-            text += pg.text + "\n";                       // real text layer: exact, no OCR needed
-            setSt({ phase: "working", msg: `Reading page ${i + 1} text…`, pct: 10 + Math.round(((i + 1) / pages.length) * 90), preview });
-          } else {
-            setSt({ phase: "working", msg: `Page ${i + 1} is an image — reading it…`, pct: 10, preview });
-            text += await ocr(pg.canvas, (p) => setSt((s) => ({ ...s, pct: 10 + Math.round(((i + p) / pages.length) * 90) }))) + "\n";
+        // Pass 1: the PDF's own text layer, when it has one. A browser-printed PDF is exact;
+        // a scanner's built-in OCR is not, so its result is checked field by field below.
+        const layer = pages.map((pg) => pg.text.replace(/\s/g, "").length >= 60 ? pg.text : "").join("\n");
+        result = layer.trim() ? extractFromText(layer) : null;
+        text = layer;
+        const want = DOC_KINDS[result ? result.kind : "other"].take;
+        const missing = result ? want.filter((k) => !fieldOk(k, result.fields[k])) : want;
+        // Pass 2: our own OCR of the page image — always for image-only pages, and for text-layer
+        // pages whenever anything the document should contain is missing or looks wrong.
+        if (!result || missing.length) {
+          let ocrText = "";
+          for (let i = 0; i < pages.length; i++) {
+            setSt({ phase: "working", msg: result ? `Checking page ${i + 1} against the image…` : `Page ${i + 1} is an image — cleaning and reading it…`,
+                    pct: 10, preview });
+            ocrText += await ocr(binarize(pages[i].canvas), (p) => setSt((s) => ({ ...s, pct: 10 + Math.round(((i + p) / pages.length) * 90) }))) + "\n";
           }
+          const second = extractFromText(ocrText);
+          text = (text + "\n\n" + ocrText).trim();
+          result = result ? mergeReads(result, second) : second;
         }
       } else {
         const { canvas, preview: p } = await prepImage(file);
         preview = p;
         setSt({ phase: "working", msg: "Loading OCR engine…", pct: 5, preview });
         text = await ocr(canvas, (p) => setSt((s) => ({ ...s, msg: "Reading document…", pct: 10 + Math.round(p * 90) })));
+        result = extractFromText(text);
       }
-      const { fields: found, hints: h, kind } = extractFromText(text);
+      const { fields: found, hints: h, kind } = result;
       // a second document adds to what the first found rather than replacing it
       setVals((prev) => ({ ...prev, ...found }));
       setHints((prev) => ({ ...prev, ...h }));
@@ -2634,6 +2716,11 @@ function ScanCard({ preop, onApply }) {
             </button>
             <button className="ar-tg" onClick={() => inRef.current?.click()}>Scan another page</button>
             <button className="ar-tg" onClick={() => setShowText((x) => !x)}>{showText ? "Hide" : "Show"} raw text</button>
+            <button className="ar-tg" onClick={async () => {
+              try { await navigator.clipboard.writeText(st.text || ""); setSt((x) => ({ ...x, copied: true }));
+                    setTimeout(() => setSt((x) => ({ ...x, copied: false })), 2000); }
+              catch { setShowText(true); }
+            }}>{st.copied ? "Copied" : "Copy raw text"}</button>
             <button className="ar-tg" onClick={reset}>Discard</button>
           </div>
           {showText && <pre className="ar-rawtext">{st.text}</pre>}
